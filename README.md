@@ -87,14 +87,22 @@ primary := "(" expr ")" | tag
 - 限速：令牌桶 4 req/s（突发 4、并发 5、5s 超时），对官方 3000 次/10 分钟限流留 20% 余量；瞬态失败重试 1 次，熔断 10 次/30s。
 - **R18 / NSFW**：本地已移除限制，但 **Bangumi 匿名 API 对 NSFW 条目直接返回 404**（实测 10/10 相关），因此未认证时这些条目只能显示「无封面」。要显示 R18 封面需配置个人访问令牌：
 
+| 项 | 值 |
+| --- | --- |
+| 文件 | `.env.local`（项目根目录；**不要**写进 `.env`，那是随仓库提交的） |
+| 键名 | `BGM_API_TOKEN` |
+| 格式 | `BGM_API_TOKEN="你的令牌"`（含特殊字符时保留引号） |
+
 ```bash
 # 1. 生成令牌：https://next.bgm.tv/demo/access-token
-# 2. 写入 .env.local（已被 .gitignore 忽略，不会入库）
+# 2. 写入 .env.local（已被 .gitignore 忽略，不会入库；模板见 .env.template）
 echo 'BGM_API_TOKEN="你的令牌"' >> .env.local
 # 3. 重启 dev
 ```
 
   令牌仅在服务端使用（不会进入浏览器）；404 负缓存 TTL 为 1 天，配置令牌后最多 1 天内自动重试。若仍不显示，可删除 `.cache/covers.db` 强制重取。
+
+> 环境变量模板见仓库根目录 `.env.template`（复制为 `.env` 用基础配置，令牌另放 `.env.local`）。
 
 ## 目录结构
 
