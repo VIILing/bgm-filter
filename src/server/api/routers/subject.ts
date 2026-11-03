@@ -1,57 +1,47 @@
 import { z } from "zod";
 
 import {
-  PAGE_SIZE,
   searchInputSchema,
   type SearchResultDto,
+  type StatsDto,
   type TagSuggestionDto,
 } from "~/shared/subject-contract";
 import { createTRPCRouter, publicProcedure } from "~/server/api/trpc";
+import {
+  getSubjectStats,
+  searchSubjects,
+  searchTags,
+} from "~/server/search/subject-search";
 
 /**
- * S1 占位实现：只保证 tRPC 链路与契约 shape 正确，返回空数据。
- * S3（api-engineer）将用 tag-dsl + subject-search 重写本文件。
+ * 标签联想 / 常用标签：q 为空 → 按 count 倒序的常用标签（F8）。
+ * 上限 50 与搜索页每页条目数一致，避免前端一次拉太多。
  */
-export interface StatsDto {
-  total: number;
-  taggedTotal: number;
-  types: { type: number; count: number }[];
-}
+const tagQuerySchema = z.object({
+  q: z.string().max(100).default(""),
+  limit: z.number().int().min(1).max(50).default(20),
+});
 
 export const subjectRouter = createTRPCRouter({
-  /** 主搜索：输入解析错误 → TRPCError code "BAD_REQUEST"（S3 实现）。 */
+  /**
+   * 主搜索。标签表达式语法错误 / 年份区间非法 → BAD_REQUEST（含位置提示）；
+   * 数据库不可用 → INTERNAL_SERVER_ERROR（含 `pnpm db:import` 提示）。
+   */
   search: publicProcedure
     .input(searchInputSchema)
-    .query((): SearchResultDto => {
-      return {
-        items: [],
-        total: 0,
-        page: 1,
-        pageSize: PAGE_SIZE,
-        totalPages: 1,
-        warnings: [],
-        parsedTags: [],
-      };
-    }),
+    .query(({ input, ctx }): Promise<SearchResultDto> =>
+      searchSubjects(input, ctx.db),
+    ),
 
-  /** 标签联想/常用标签：q 为空 → 按 count 倒序的常用标签。 */
+  /** 标签联想 / 常用标签。 */
   tags: publicProcedure
-    .input(
-      z.object({
-        q: z.string().max(100).default(""),
-        limit: z.number().int().min(1).max(50).default(20),
-      }),
-    )
-    .query((): TagSuggestionDto[] => {
-      return [];
-    }),
+    .input(tagQuerySchema)
+    .query(({ input, ctx }): Promise<TagSuggestionDto[]> =>
+      searchTags(input, ctx.db),
+    ),
 
   /** 头部统计：总条目、有标签条目数、各类型条目数。 */
-  stats: publicProcedure.query((): StatsDto => {
-    return {
-      total: 0,
-      taggedTotal: 0,
-      types: [],
-    };
-  }),
+  stats: publicProcedure.query(({ ctx }): Promise<StatsDto> =>
+    getSubjectStats(ctx.db),
+  ),
 });

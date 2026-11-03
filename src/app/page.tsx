@@ -1,22 +1,30 @@
-"use client";
+import { Suspense } from "react";
 
-import { trpc } from "~/trpc/react";
+import { Header } from "~/components/Header";
+import { HomeClient } from "~/components/HomeClient";
+import { SkeletonRows } from "~/components/SkeletonRows";
 
 /**
- * S1 占位页：只验证 tRPC 链路（stats 查询）可通。S4 会重写为完整筛选界面。
+ * 单页入口（Server Component）。`useSearchParams` 必须在 Suspense 边界内，
+ * 因此把全部客户端交互放在 HomeClient 中。
  */
 export default function HomePage() {
-  const stats = trpc.subject.stats.useQuery();
-
   return (
-    <main className="mx-auto flex max-w-3xl flex-col gap-4 px-6 py-16">
-      <h1 className="text-3xl font-bold tracking-tight">BGM Filter</h1>
-      <p className="text-lg text-slate-600">筛选界面开发中</p>
-      <p className="text-sm text-slate-500">
-        {stats.isLoading && "正在读取统计…"}
-        {stats.error && `统计读取失败：${stats.error.message}`}
-        {stats.data && `当前数据库共 ${stats.data.total.toLocaleString("zh-CN")} 条条目`}
-      </p>
-    </main>
+    <Suspense fallback={<PageFallback />}>
+      <HomeClient />
+    </Suspense>
+  );
+}
+
+function PageFallback() {
+  return (
+    <div className="min-h-screen bg-slate-50">
+      <Header isLoading />
+      <main className="mx-auto w-full max-w-7xl px-4 py-4">
+        <div className="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
+          <SkeletonRows />
+        </div>
+      </main>
+    </div>
   );
 }

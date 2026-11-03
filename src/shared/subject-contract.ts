@@ -52,4 +52,10 @@ export interface TagSuggestionDto {
   count: number;
 }
 
+export interface StatsDto {
+  total: number;
+  taggedTotal: number;
+  types: { type: number; count: number }[];
+}
+
 export const PAGE_SIZE = 50;
