@@ -1,5 +1,7 @@
 # BGM Filter
 
+> 二次开发 / 接手项目？先读 **[AGENTS.md](AGENTS.md)**（环境、约束、模块地图、故障排查、交接清单）。
+
 本地运行的 Bangumi 条目筛选工具：把 Bangumi Archive 的全量条目 dump 一次性导入本地 SQLite，然后在网页上按**标签表达式 + 年代 + 类型 + 名称**筛选，并按**评分**排序浏览结果。纯离线、无登录、无外部服务。
 
 ## 功能（V1）
@@ -131,6 +133,21 @@ docs/                    # 需求、架构、UI 设计、数据报告、QA 报�
 - 单元测试：DSL 解析（优先级/括号/取反/引号/错误位置）、SQL 编译语义（内存 SQLite 执行验证）、URL 状态往返、标签插入转义。
 - 集成测试：真实 `prisma/dev.db` 上验证计数、子集关系、年份/类型过滤、排序、分页夹取、unknown tag 警告；无 DB 时自动跳过。
 - 验收结论见 `docs/qa-report.md`，数据导入证据见 `docs/data-report.md`。
+
+## 开发与交接
+
+| 文档 | 内容 |
+| --- | --- |
+| [AGENTS.md](AGENTS.md) | **主 Agent 手册**：环境、启动、约束、模块职责、故障排查、待办、交接清单 |
+| [docs/requirements.md](docs/requirements.md) | 需求规格与验收清单 |
+| [docs/architecture.md](docs/architecture.md) | 数据模型、接口契约、查询/DSL/排序实现、BgmClient |
+| [docs/ui-design.md](docs/ui-design.md) | 页面骨架、组件规格、悬浮预览交互 |
+| [docs/data-report.md](docs/data-report.md) | 数据导入报告（计数、体积、性能） |
+| [docs/qa-report.md](docs/qa-report.md) | 逐条验收证据与历次迭代（V1.1–V1.6） |
+| [docs/cover-research.md](docs/cover-research.md) | 封面 API/CDN 可行性调研 |
+
+常用命令：`pnpm dev`、`pnpm test`、`pnpm typecheck`、`pnpm build`、`pnpm db:import`。
+提交前请确认 `git status` 不含 `dump-db/`、`prisma/*.db`、`.cache/`、`.env.local`。
 
 ## 已知限制（V1 非目标）
 
