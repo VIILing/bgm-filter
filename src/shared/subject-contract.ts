@@ -16,7 +16,7 @@ export const searchInputSchema = z.object({
   types: z.array(z.number().int()).optional(),          // undefined/[] → 全选
   yearFrom: z.number().int().min(1000).max(2100).nullable().optional(),
   yearTo: z.number().int().min(1000).max(2100).nullable().optional(),
-  sort: z.enum(["score_desc", "score_asc"]).default("score_desc"),
+  sort: z.enum(["weighted_desc", "score_desc", "score_asc"]).default("weighted_desc"),
   scoreless: z.enum(["last", "first"]).default("last"),
   page: z.number().int().min(1).default(1),
 });

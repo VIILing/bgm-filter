@@ -21,6 +21,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { SearchInput } from "~/shared/subject-contract";
 import { createCaller } from "~/server/api/root";
 import {
+  BAYESIAN_PRIOR_VOTES,
+  bayesianWeightedScore,
   getSubjectStats,
   searchSubjects,
   searchTags,
@@ -65,11 +67,11 @@ if (!availability.available) {
   console.warn(`[integration] 跳过真实数据测试：${availability.reason}`);
 }
 
-/** 输入补全：SearchInput 的默认值与 contract 一致。 */
+/** 输入补全：SearchInput 的默认值与 contract 一致（默认综合评分 = 贝叶斯加权）。 */
 const BASE_INPUT: SearchInput = {
   tagExpr: "",
   q: "",
-  sort: "score_desc",
+  sort: "weighted_desc",
   scoreless: "last",
   page: 1,
 };
@@ -128,19 +130,26 @@ describe.skipIf(!availability.available)(
   `subject-search（真实数据：${availability.reason}）`,
   () => {
     let client: PrismaClient;
+    /** 独立用 SQL 复算的全局按人次加权平均分（避免用被测函数自证）。 */
+    let globalMean: number;
 
-    beforeAll(() => {
+    beforeAll(async () => {
       client = new PrismaClient({
         datasourceUrl: `file:${DEV_DB_PATH}`,
         log: ["error"],
       });
+      const rows = await client.$queryRawUnsafe<{ c: number | null }[]>(
+        `SELECT SUM(s."score" * s."scoreVotes") * 1.0 / SUM(s."scoreVotes") AS c FROM "Subject" s WHERE s."score" > 0`,
+      );
+      globalMean = Number(rows[0]?.c);
+      expect(globalMean).toBeGreaterThan(0);
     });
 
     afterAll(async () => {
       await client.$disconnect();
     });
 
-    it("默认搜索：total=700108、首页 50 条、score 降序且 0 分在最后", async () => {
+    it("默认搜索（综合评分）：total=700108、首页 50 条、weighted 单调不增且无「1 人 10 分」", async () => {
       const result = await searchSubjects(input(), client);
 
       expect(result.total).toBe(700_108);
@@ -154,10 +163,63 @@ describe.skipIf(!availability.available)(
       const scores = result.items.map((item) => item.score);
       // 首页全部有评分（总数据 287,448 条有评分，首页轮不到 0 分）。
       expect(scores.every((score) => score > 0)).toBe(true);
+
+      // 用独立取得的 C + 同一公式复算，首页 weighted 必须单调不增。
+      const weighted = result.items.map((item) =>
+        bayesianWeightedScore(item.score, item.scoreVotes, globalMean, BAYESIAN_PRIOR_VOTES),
+      );
+      for (let index = 1; index < weighted.length; index += 1) {
+        expect(weighted[index]!).toBeLessThanOrEqual(weighted[index - 1]! + 1e-9);
+      }
+
+      // 「1 人打 10 分」不再登顶：id 1630（あまつき (1)）不在默认首页。
+      expect(result.items.map((item) => item.id)).not.toContain(1630);
+      expect(
+        result.items.some((item) => item.score === 10 && item.scoreVotes === 1),
+      ).toBe(false);
+
+      // 加权榜首应是高票高分条目，而不是小样本 10 分。
+      expect(result.items[0]).toMatchObject({
+        id: 62_229,
+        score: 9.4,
+        scoreVotes: 7_154,
+      });
+      expect(result.items[0]!.scoreVotes).toBeGreaterThan(1_000);
+    });
+
+    it("score_desc：仍复现原始评分降序（1 人 10 分的 id 1630 回到第一页）", async () => {
+      const result = await searchSubjects(input({ sort: "score_desc" }), client);
+
+      expect(result.items).toHaveLength(50);
+      expect(result.items[0]).toMatchObject({
+        id: 1630,
+        score: 10,
+        scoreVotes: 1,
+      });
+
+      const scores = result.items.map((item) => item.score);
       for (let index = 1; index < scores.length; index += 1) {
         expect(scores[index]!).toBeLessThanOrEqual(scores[index - 1]!);
       }
-      // 稳定排序：同分时 id 升序。
+      // 原始排序同分时 id 升序（稳定）。
+      for (let index = 1; index < result.items.length; index += 1) {
+        const previous = result.items[index - 1]!;
+        const current = result.items[index]!;
+        if (previous.score === current.score) {
+          expect(current.id).toBeGreaterThan(previous.id);
+        }
+      }
+    });
+
+    it("score_asc：原始评分升序，首页全部为最低有评分条目（1.0）", async () => {
+      const result = await searchSubjects(input({ sort: "score_asc" }), client);
+
+      expect(result.items).toHaveLength(50);
+      expect(result.items.every((item) => item.score === 1)).toBe(true);
+      const scores = result.items.map((item) => item.score);
+      for (let index = 1; index < scores.length; index += 1) {
+        expect(scores[index]!).toBeGreaterThanOrEqual(scores[index - 1]!);
+      }
       for (let index = 1; index < result.items.length; index += 1) {
         const previous = result.items[index - 1]!;
         const current = result.items[index]!;
@@ -382,7 +444,7 @@ describe.skipIf(!availability.available)(
         return value;
       };
 
-      console.log("[perf] 默认搜索（700,108 条，ORDER BY score）：");
+      console.log("[perf] 默认搜索（700,108 条，ORDER BY weighted）：");
       const defaultMs = await measure(() => searchSubjects(input(), client));
 
       console.log("[perf] 标签表达式「科幻 & 年度」：");

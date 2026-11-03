@@ -17,7 +17,7 @@ describe("parseFilterState", () => {
       types: [...ALL_TYPE_VALUES],
       yearFrom: null,
       yearTo: null,
-      sort: "score_desc",
+      sort: "weighted_desc",
       scoreless: "last",
       page: 1,
     });
@@ -62,9 +62,15 @@ describe("parseFilterState", () => {
     });
     expect(state.yearFrom).toBeNull();
     expect(state.yearTo).toBeNull();
-    expect(state.sort).toBe("score_desc");
+    expect(state.sort).toBe("weighted_desc");
     expect(state.scoreless).toBe("last");
     expect(state.page).toBe(1);
+  });
+
+  it("接受 weighted_desc / score_desc / score_asc 三种排序值", () => {
+    expect(parseFilterState({ sort: "weighted_desc" }).sort).toBe("weighted_desc");
+    expect(parseFilterState({ sort: "score_desc" }).sort).toBe("score_desc");
+    expect(parseFilterState({ sort: "score_asc" }).sort).toBe("score_asc");
   });
 
   it("边界年份 1000 / 2100 合法，越界回退", () => {
@@ -88,6 +94,19 @@ describe("parseFilterState", () => {
 describe("toSearchParams", () => {
   it("默认值全部省略", () => {
     expect(toSearchParams(createDefaultFilterState()).toString()).toBe("");
+    // 显式传入默认 weighted_desc 也不写入 URL。
+    expect(
+      toSearchParams({ ...createDefaultFilterState(), sort: "weighted_desc" }).has("sort"),
+    ).toBe(false);
+  });
+
+  it("原始评分排序显式写入 sort（默认综合评分省略）", () => {
+    expect(
+      toSearchParams({ ...createDefaultFilterState(), sort: "score_desc" }).get("sort"),
+    ).toBe("score_desc");
+    expect(
+      toSearchParams({ ...createDefaultFilterState(), sort: "score_asc" }).get("sort"),
+    ).toBe("score_asc");
   });
 
   it("按契约顺序写入非默认值", () => {

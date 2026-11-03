@@ -77,7 +77,7 @@ function createDefaultUiState(): UiState {
     types: [...ALL_TYPE_VALUES],
     yearFromText: "",
     yearToText: "",
-    sort: "score_desc",
+    sort: "weighted_desc",
     scoreless: "last",
     page: 1,
   };
@@ -237,7 +237,7 @@ export function HomeClient() {
     isAllTypes(state.types) &&
     state.yearFromText.trim() === "" &&
     state.yearToText.trim() === "" &&
-    state.sort === "score_desc" &&
+    state.sort === "weighted_desc" &&
     state.scoreless === "last" &&
     state.page === 1;
 

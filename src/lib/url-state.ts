@@ -3,7 +3,7 @@ import { SUBJECT_TYPES } from "../shared/subject-contract";
 /** 归档类型（与 shared 契约保持一致）：1 漫画 / 2 动画 / 3 音乐 / 4 游戏 / 6 三次元。 */
 export const ALL_TYPE_VALUES: readonly number[] = SUBJECT_TYPES.map((t) => t.value);
 
-export type SortMode = "score_desc" | "score_asc";
+export type SortMode = "weighted_desc" | "score_desc" | "score_asc";
 export type ScorelessMode = "last" | "first";
 
 /** URL 可表达、且前端/服务端查询共用的筛选状态。 */
@@ -35,7 +35,7 @@ export const DEFAULT_FILTER_STATE: FilterState = {
   types: [...ALL_TYPE_VALUES],
   yearFrom: null,
   yearTo: null,
-  sort: "score_desc",
+  sort: "weighted_desc",
   scoreless: "last",
   page: 1,
 };
@@ -114,7 +114,10 @@ export function parseFilterState(searchParams: SearchParamsInput): FilterState {
     types: parseTypesParam(readParam(searchParams, "types")),
     yearFrom: parseYearParam(readParam(searchParams, "from")),
     yearTo: parseYearParam(readParam(searchParams, "to")),
-    sort: rawSort === "score_asc" ? "score_asc" : "score_desc",
+    sort:
+      rawSort === "score_desc" || rawSort === "score_asc"
+        ? rawSort
+        : "weighted_desc",
     scoreless: rawScoreless === "first" ? "first" : "last",
     page: parsePageParam(readParam(searchParams, "page")),
   };
@@ -149,7 +152,10 @@ export function toSearchParams(state: FilterState): URLSearchParams {
     params.set("to", String(state.yearTo));
   }
 
-  if (state.sort === "score_asc") params.set("sort", "score_asc");
+  // 默认 weighted_desc 省略；原始评分排序显式写入。
+  if (state.sort === "score_desc" || state.sort === "score_asc") {
+    params.set("sort", state.sort);
+  }
   if (state.scoreless === "first") params.set("scoreless", "first");
   if (Number.isSafeInteger(state.page) && state.page > 1) params.set("page", String(state.page));
 

@@ -29,8 +29,18 @@ export const DB_UNAVAILABLE_MESSAGE = "数据库未导入或不可读，请先�
 /** 标签展示上限（F8）。 */
 const MAX_CARD_TAGS = 8;
 
+/** 贝叶斯加权评分：先验强度 m（评分人数中位数仅 3、p90=45）。 */
+export const BAYESIAN_PRIOR_VOTES = 50;
+
+/** 全局均值查询失败时的兜底值（当前 dump 实测 7.104，dump 静态不变）。 */
+export const FALLBACK_GLOBAL_MEAN_SCORE = 7.1;
+
 interface CountRow {
   c: number | bigint;
+}
+
+interface GlobalMeanRow {
+  c: number | null;
 }
 
 interface SubjectRow {
@@ -209,11 +219,94 @@ function buildWhere(input: SearchInput, ast: TagExpr): WhereParts {
   };
 }
 
-/** ORDER BY：无评分位置 → 评分 → id 稳定排序。 */
-function buildOrderBy(input: SearchInput): string {
+/**
+ * 贝叶斯加权评分（IMDb weighted rating）：`(score*votes + C*m) / (votes + m)`。
+ *
+ * 纯函数，便于单测与脚本复算；`score = 0` 的条目由调用方按「无评分」分组，
+ * 不参与加权排序。C 为全局按人次加权平均分（动态查询，见 `getGlobalMeanScore`）。
+ */
+export function bayesianWeightedScore(
+  score: number,
+  scoreVotes: number,
+  globalMean: number = FALLBACK_GLOBAL_MEAN_SCORE,
+  priorVotes: number = BAYESIAN_PRIOR_VOTES,
+): number {
+  const votes = Number.isFinite(scoreVotes) ? Number(scoreVotes) : 0;
+  const value = Number.isFinite(score) ? Number(score) : 0;
+  return (value * votes + globalMean * priorVotes) / (votes + priorVotes);
+}
+
+/**
+ * 全局按人次加权平均分 C：`SUM(score*scoreVotes) / SUM(scoreVotes)`，仅统计
+ * `score > 0` 的条目（无评分条目没有有效分值，不能混进均值）。
+ *
+ * 缓存策略：模块级 WeakMap<PrismaClient, Promise<number>> 缓存计算结果。
+ * dump 是静态只读数据，一次导入后 C 不再变化，因此进程内缓存即可；用
+ * Promise 缓存可避免并发首查重复打 DB；按 client 实例缓存则让测试 / 多库
+ * 各自得到自己的 C。查询失败不缓存（删除缓存项），回退 7.1 并允许下次重试。
+ */
+const globalMeanCache = new WeakMap<PrismaClient, Promise<number>>();
+
+export async function getGlobalMeanScore(
+  client: PrismaClient = defaultDb,
+): Promise<number> {
+  const cached = globalMeanCache.get(client);
+  if (cached !== undefined) return cached;
+
+  const pending = (async (): Promise<number> => {
+    try {
+      const rows = await client.$queryRawUnsafe<GlobalMeanRow[]>(
+        `SELECT SUM(s."score" * s."scoreVotes") * 1.0 / SUM(s."scoreVotes") AS c FROM "Subject" s WHERE s."score" > 0`,
+      );
+      const value = Number(rows[0]?.c);
+      return Number.isFinite(value) && value > 0
+        ? value
+        : FALLBACK_GLOBAL_MEAN_SCORE;
+    } catch {
+      // 失败不缓存：下次请求可重试（例如 db:import 刚完成）。
+      globalMeanCache.delete(client);
+      return FALLBACK_GLOBAL_MEAN_SCORE;
+    }
+  })();
+
+  globalMeanCache.set(client, pending);
+  return pending;
+}
+
+interface OrderParts {
+  /** 不含 "ORDER BY " 前缀。 */
+  orderSql: string;
+  /** 与 orderSql 中 `?` 顺序一致，拼在 WHERE 参数之后。 */
+  params: unknown[];
+}
+
+/**
+ * ORDER BY：无评分分组 → 评分维度 → id 稳定排序。
+ *
+ * - 无评分：`(s."score" = 0) ASC|DESC`；
+ * - `weighted_desc`：`(score*scoreVotes + C*m)/(scoreVotes + m) DESC`，
+ *   C / m 全部走 `?` 参数（不拼接数值），参数顺序为 [C, m, m]；
+ * - `score_desc` / `score_asc`：原始 `s."score" DESC|ASC`，再 `s."id" ASC`。
+ */
+async function buildOrderBy(
+  input: SearchInput,
+  client: PrismaClient,
+): Promise<OrderParts> {
   const scorelessDirection = input.scoreless === "first" ? "DESC" : "ASC";
+
+  if (input.sort === "weighted_desc") {
+    const globalMean = await getGlobalMeanScore(client);
+    return {
+      orderSql: `(s."score" = 0) ${scorelessDirection}, (s."score" * s."scoreVotes" + ? * ?) * 1.0 / (s."scoreVotes" + ?) DESC, s."score" DESC, s."id" ASC`,
+      params: [globalMean, BAYESIAN_PRIOR_VOTES, BAYESIAN_PRIOR_VOTES],
+    };
+  }
+
   const scoreDirection = input.sort === "score_asc" ? "ASC" : "DESC";
-  return `(s."score" = 0) ${scorelessDirection}, s."score" ${scoreDirection}, s."id" ASC`;
+  return {
+    orderSql: `(s."score" = 0) ${scorelessDirection}, s."score" ${scoreDirection}, s."id" ASC`,
+    params: [],
+  };
 }
 
 const SUBJECT_COLUMNS = [
@@ -331,15 +424,18 @@ export async function searchSubjects(
     );
     const offset = (page - 1) * PAGE_SIZE;
 
-    const rows: SubjectRow[] =
-      total === 0
-        ? []
-        : await client.$queryRawUnsafe<SubjectRow[]>(
-            `SELECT ${SUBJECT_COLUMNS} FROM "Subject" s${where.whereSql} ORDER BY ${buildOrderBy(input)} LIMIT ? OFFSET ?`,
-            ...where.params,
-            PAGE_SIZE,
-            offset,
-          );
+    let rows: SubjectRow[] = [];
+    if (total > 0) {
+      const order = await buildOrderBy(input, client);
+      // 参数顺序：WHERE → ORDER BY（weighted 时为 C/m/m）→ LIMIT/OFFSET。
+      rows = await client.$queryRawUnsafe<SubjectRow[]>(
+        `SELECT ${SUBJECT_COLUMNS} FROM "Subject" s${where.whereSql} ORDER BY ${order.orderSql} LIMIT ? OFFSET ?`,
+        ...where.params,
+        ...order.params,
+        PAGE_SIZE,
+        offset,
+      );
+    }
 
     const subjectIds = rows.map((row) => Number(row.id));
     const pageTagRows: PageTagRow[] =

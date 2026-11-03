@@ -17,7 +17,7 @@ const defaultSegmentClass = (active: boolean) =>
     active ? "bg-sky-600 text-white" : "bg-white text-slate-600 hover:bg-slate-100"
   }`;
 
-/** 评分排序 + 无评分条目位置。 */
+/** 评分排序（默认贝叶斯加权）+ 无评分条目位置。 */
 export function SortControls({ sort, scoreless, onSortChange, onScorelessChange }: SortControlsProps) {
   return (
     <div className="flex flex-wrap items-end gap-4">
@@ -26,9 +26,27 @@ export function SortControls({ sort, scoreless, onSortChange, onScorelessChange 
         <div className="inline-flex overflow-hidden rounded-md border border-slate-300" role="group" aria-label="评分排序">
           <button
             type="button"
+            aria-pressed={sort === "weighted_desc"}
+            onClick={() => onSortChange("weighted_desc")}
+            className={segmentButtonClass(sort === "weighted_desc")}
+          >
+            <span className="inline-flex items-center gap-1">
+              综合评分
+              <span
+                className="inline-flex h-4 w-4 cursor-help items-center justify-center rounded-full border border-slate-300 text-[10px] font-normal opacity-80"
+                title="按贝叶斯加权：评分 × 人数，弱化小样本刷分"
+                aria-label="按贝叶斯加权：评分 × 人数，弱化小样本刷分"
+                role="img"
+              >
+                ?
+              </span>
+            </span>
+          </button>
+          <button
+            type="button"
             aria-pressed={sort === "score_desc"}
             onClick={() => onSortChange("score_desc")}
-            className={segmentButtonClass(sort === "score_desc")}
+            className={`border-l border-slate-300 ${segmentButtonClass(sort === "score_desc")}`}
           >
             评分从高到低
           </button>

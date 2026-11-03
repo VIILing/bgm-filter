@@ -231,7 +231,13 @@ tag     := quotedTag | bareTag
 - 无评分位置：
   - `last`：`(s."score" = 0) ASC`；
   - `first`：`(s."score" = 0) DESC`。
-- 再按 `s."score" DESC|ASC`、最后 `s."id" ASC` 稳定排序。
+- `weighted_desc`（默认「综合评分」，贝叶斯加权）：
+  `(s."score" * s."scoreVotes" + C * m) * 1.0 / (s."scoreVotes" + m) DESC` → `s."score" DESC` → `s."id" ASC`。
+  - `C = SUM(score*scoreVotes)/SUM(scoreVotes)`（仅 `score > 0`；模块级缓存，dump 为静态数据，查询失败回退 7.1）；
+  - `m = 50`；C / m 全部通过 `?` 参数传入，不拼接数值。
+- `score_desc` / `score_asc`（原始评分）：`s."score" DESC|ASC` → `s."id" ASC`。
+- 加权只作用于 `score > 0`；`score = 0` 由上面的分组单独排序，不参与加权。
+- 参数拼接顺序：`WHERE` → `ORDER BY`（weighted 时为 `[C, m, m]`）→ `LIMIT/OFFSET`；`COUNT(*)` 不传 ORDER 参数。
 
 **分页**：`LIMIT 50 OFFSET (page-1)*50`；先查 `COUNT(*)` 得到总数（同 WHERE），`totalPages = max(1, ceil(total/50))`，`page` 夹取到 `[1, totalPages]` 后重新计算 OFFSET。
 
@@ -262,7 +268,7 @@ export const searchInputSchema = z.object({
   types: z.array(z.number().int()).optional(),          // undefined/[] → 全选
   yearFrom: z.number().int().min(1000).max(2100).nullable().optional(),
   yearTo: z.number().int().min(1000).max(2100).nullable().optional(),
-  sort: z.enum(["score_desc", "score_asc"]).default("score_desc"),
+  sort: z.enum(["weighted_desc", "score_desc", "score_asc"]).default("weighted_desc"),
   scoreless: z.enum(["last", "first"]).default("last"),
   page: z.number().int().min(1).default(1),
 });
@@ -346,7 +352,7 @@ export type AppRouter = typeof appRouter;
   - `EmptyState`、`ErrorState`、`SkeletonRows`。
 - URL 状态纯函数放 `src/lib/url-state.ts`：
   ```ts
-  interface FilterState { tagExpr: string; q: string; types: number[]; yearFrom: number | null; yearTo: number | null; sort: "score_desc" | "score_asc"; scoreless: "last" | "first"; page: number }
+  interface FilterState { tagExpr: string; q: string; types: number[]; yearFrom: number | null; yearTo: number | null; sort: "weighted_desc" | "score_desc" | "score_asc"; scoreless: "last" | "first"; page: number }
   parseFilterState(searchParams: URLSearchParams | Record<string, string | string[] | undefined>): FilterState
   toSearchParams(state: FilterState): URLSearchParams   // 默认值省略；types 用 "1,2,3,4,6"；page=1 省略
   ```
