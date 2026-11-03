@@ -1,0 +1,48 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Subject {
+  id           Int      @id
+  type         Int      // 1漫画 2动画 3音乐 4游戏 6三次元
+  name         String
+  nameCn       String?
+  date         String?  // 原始 "YYYY-MM-DD"，可能为 null
+  year         Int?     // date 前 4 位数字；无效为 null
+  score        Float    @default(0)   // 0 表示无评分
+  scoreVotes   Int      @default(0)   // sum(score_details.values)
+  rank         Int?     // 0 → null
+  nsfw         Boolean  @default(false)
+  favoriteJson String?  // JSON 字符串 {"wish":n,"done":n,"doing":n,"on_hold":n,"dropped":n}
+  tagsJson     String?  // 用户标签 JSON: [{"name":"科幻","count":6}, ...]（最多 10 个，原顺序）
+  metaTagsJson String?  // 公共标签 JSON: ["漫画","BL", ...]
+  tags         SubjectTag[]
+
+  @@index([type])
+  @@index([year])
+  @@index([score])
+  @@index([type, score])
+}
+
+model Tag {
+  id        Int    @id @default(autoincrement())
+  name      String            // 规范展示名（大小写以出现次数最多的写法为准）
+  nameLower String @unique    // name.toLowerCase()，DSL 匹配键
+  count     Int    @default(0) // 含该标签的条目数（tags ∪ meta_tags）
+  subjects  SubjectTag[]
+}
+
+model SubjectTag {
+  subjectId Int
+  tagId     Int
+  subject   Subject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  tag       Tag     @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([subjectId, tagId])
+  @@index([tagId, subjectId])
+}
