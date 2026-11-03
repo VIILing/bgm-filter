@@ -280,7 +280,7 @@ describe.skipIf(!availability.available)(
         expect(page1Ids.has(item.id)).toBe(false);
       }
 
-      // 小结果集：87 条 → 2 页；page=9999 应被夹到第 2 页。
+      // 小结果集：科幻 & 百合 212 条 → 5 页；page=9999 应被夹到末页（第 5 页）。
       const clamped = await searchSubjects(
         input({ tagExpr: "科幻 & 百合", page: 9999 }),
         client,

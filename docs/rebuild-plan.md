@@ -76,7 +76,7 @@ pnpm dev
 | Subject 总数 | 700,108 | `SELECT COUNT(*) FROM Subject` |
 | 按类型 | 1: 422,971 / 2: 31,258 / 3: 101,230 / 4: 117,881 / 6: 26,768 | 与 dump 一致 |
 | Tag 去重数 | ≈ 92,878 | tags ∪ meta_tags，按 `nameLower` 去重 |
-| SubjectTag 关联数 | > 4,000,000（待导入实测记录） | 覆盖 422,912 个有标签条目 |
+| SubjectTag 关联数 | 2,267,357（实测；Σ 每条目 tags∪meta_tags 去重） | 覆盖 422,912 个有标签条目 |
 | 有评分条目 | 287,448（41.0%） | score > 0 |
 | 导入耗时 | ≤ 5 分钟 | 超时需优化批量/事务/PRAGMA |
 | DB 体积 | ≤ 600 MB | `prisma/dev.db` |
