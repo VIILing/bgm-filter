@@ -569,3 +569,119 @@ $ tsc --noEmit                        # 无输出，exit 0
 | 暖缓存回归 | ✅ | 47 / 3 / 0，console 0，meta 不变 |
 
 **最终结论：P2 修复通过验收并从 §8.8.6 关闭**；封面功能（P1 + P2）至此全部关闭，剩余仅有 §8.6 的既有风险（缓存跨 dump、进程内限速、CDN 直连等），无新增阻断项。综上，本次封面变更整体判定：**通过**。
+
+---
+
+### 8.10 NSFW 门禁移除与 token 支持（V1.3）
+
+> 复验时间：2026-11-03 20:23–20:33；dev 仍是 PID 41075（18:00:31 启动，**未重启**）；**未设置** `BGM_API_TOKEN`；`.cache/covers.db` 仅只读查询，未删除/写入任何行（应用自身因请求写入的 404 负缓存除外）。
+> 变更范围：`src/server/cover/cover-service.ts`（20:20）、`cover-cache.ts`（20:19）、新增 `cover-cache.test.ts`（20:20）。
+
+#### 8.10.1 质量门禁（实测）
+
+```text
+$ pnpm test
+ Test Files  11 passed (11)
+      Tests  151 passed (151)        # 较 §8.9 的 146 +5，新增 cover-cache 用例文件
+   Duration  4.65s (transform 254ms, setup 0ms, collect 588ms, tests 4.63s, environment 2ms)
+$ pnpm typecheck
+$ tsc --noEmit                        # 无输出，exit 0
+```
+
+| 项 | 结果 |
+| --- | --- |
+| `pnpm test` | ✅ 11 文件 / **151 用例**全绿（4.65 s） |
+| `pnpm typecheck` | ✅ exit 0，0 error |
+| 新增用例 | ✅ `cover-cache.test.ts`（v3 迁移 / reason / TTL）+ token header 两条（`BGM_API_TOKEN` 有/无） |
+
+#### 8.10.2 代码层验证
+
+| 声称 | 实测 | 结果 |
+| --- | --- | --- |
+| 不再查询 `Subject.nsfw` | `grep -n "queryRaw\|\$query\|FROM Subject" cover-service.ts` **无匹配**；全文仅注释出现 NSFW | ✅ |
+| `client` 保留但不使用 | `getCovers(ids, client?)` → `resolveCovers(ids)`；内部 `_client?: PrismaClient` 从未读取，注释写明“仅为兼容 tRPC router 签名保留；实现不再查询 `Subject.nsfw`” | ✅ |
+| 可选 `BGM_API_TOKEN` | `buildCoverRequestHeaders(token = process.env.BGM_API_TOKEN)`：有值时加 `Authorization: Bearer <token>`，否则只有 UA/Accept；默认 fetcher 使用该函数 | ✅ |
+| 缓存 v3 | `COVER_CACHE_VERSION = 3`；迁移事务内 `DELETE FROM cover_cache WHERE missing = 1` → `UPDATE ... reason='ok' WHERE missing=0` → `PRAGMA user_version = 3`；新增 `reason TEXT NOT NULL DEFAULT 'unknown'`（旧库 `ALTER TABLE`） | ✅ |
+| 负缓存 TTL 分原因 | `not_found` → `COVER_NOT_FOUND_TTL_MS = 24h`；`no_image`/`unknown` → `COVER_NEGATIVE_TTL_MS = 7d`；`getMany` 按 reason 选 TTL | ✅ |
+
+**独立调用验证 token 头**（vite-node 直接调用真实函数，未设环境变量）：
+
+```text
+buildCoverRequestHeaders("secret-token") → {User-Agent, Accept, Authorization: "Bearer secret-token"}
+buildCoverRequestHeaders(undefined)      → {User-Agent, Accept}            # 无 Authorization
+buildCoverRequestHeaders("   ")          → {User-Agent, Accept}            # 空白 token 视为未配置
+```
+
+#### 8.10.3 上游事实复核（关键前提）
+
+匿名 `GET https://api.bgm.tv/v0/subjects/{id}` 独立抽样（本轮 4 个，与实现者 10/10 抽样方向一致）：
+
+| id | 类型 | HTTP |
+| --- | --- | --- |
+| 4639 素晴らしき日々 | NSFW | **404** |
+| 22290 WHITE ALBUM2 -closing chapter- | NSFW | **404** |
+| 328609 | 普通 | 200 |
+| 10380 | 普通 | 200 |
+
+**结论：上游对未认证请求隐藏 NSFW 条目（404），因此移除本品 NSFW 门禁后，匿名部署下 NSFW 仍拿不到封面——这是上游行为，不是回归。** 另：bgm.tv 页面同样只给通用页（实现者所述，本轮未单独复核网页侧）。
+配套设计：404 负缓存 TTL 缩到 **1 天**，配置 token 后最多 1 天自动重试（此前为 7 天），避免旧 404 长期挡住 R18 封面。
+
+#### 8.10.4 线上接口（7737）
+
+| 请求 | 实测 |
+| --- | --- |
+| `ids=[22290,62229]` 第 1 次 | **24 ms**；`22290=null`，`62229.small=https://lain.bgm.tv/r/200/pic/cover/l/60/d8/62229_5Yt0j.jpg` |
+| `ids=[22290,62229]` 第 2 次（暖） | **11 ms**（<50 ms ✅） |
+| `ids=[4639]` | **7 ms**；`{"4639":null}` |
+
+22290/4639 的 null 来自上游 404（已写入 `reason='not_found'` 负缓存），而非 NSFW 判断。
+
+#### 8.10.5 页面回归（首页 1440×1000）
+
+| 项 | 8.10 实测 | 8.9 | 结果 |
+| --- | --- | --- | --- |
+| 卡片数 | 50 | 50 | ✅ |
+| 封面数 `/r/200/` | **47**（全部 loaded，0 裂图） | 47 | ✅ |
+| 占位数 | **3**（226254、22290、424578，均 NSFW） | 3 | ✅ |
+| 裂图 | **0** | 0 | ✅ |
+| console error / pageerror | **0 / 0** | 0 / 0 | ✅ |
+| 评分 meta | `9.4 · 7,154 人评分 #1 看过 8,342`（首卡，与之前一致） | 同 | ✅ |
+| 卡内 `.text-2xl` | 0 | 0 | ✅ |
+| 卡片链接 | 50/50 `bgm.tv/subject/{id}` + `_blank` | 同 | ✅ |
+| 50 条文字 / 首图 | 1,068 ms / 1,484 ms | 755 / 1,064 ms | ⚠️ 略慢（见下） |
+
+> 首屏较 §8.9 慢约 0.3–0.4 s：本轮首页 3 个 NSFW 负缓存已被 v3 迁移清空，首次加载需各自回源 404（约 0.25 s/次）后再写负缓存；第二次加载应回到 1.0 s 量级。属迁移后一次性成本，非回归。
+
+#### 8.10.6 缓存 v3 实查（只读）
+
+```text
+PRAGMA user_version            → 3
+PRAGMA table_info(cover_cache) → id, grid, small, common, fetchedAt, missing, reason
+SELECT missing, reason, COUNT(*) GROUP BY ... →
+  missing=0, reason=ok        n=652
+  missing=1, reason=not_found n=4
+total = 656
+```
+
+- **迁移生效**：负缓存只剩 4 行，且 `fetchedAt` 均为本轮 20:22–20:24 产生的 404（22290、4639、226254、424578）；正缓存 652 行保留（如 62229 的 `fetchedAt` 早于迁移 ~88 分钟）→ “清空 `missing=1`、保留正缓存、补 `reason` 列”三项均得到数据验证。
+- 迁移后新增负缓存均为 `not_found`（1 天 TTL），无 `no_image`/`unknown` 行（本轮未遇到 200-空图与未知失败）。
+
+#### 8.10.7 未验证项（需 token + 重启）
+
+| 项 | 状态 | 说明 |
+| --- | --- | --- |
+| 带 `BGM_API_TOKEN` 的端到端取图 | ⚠️ **未验证** | 约束要求不设置 token 环境变量，dev 进程 env 中确认无 `BGM_API_TOKEN`（`/proc/41075/environ` 仅有 `NODE_ENV=development`）。代码/单测/独立函数调用已证明 header 形态正确，但“带 token 后 NSFW 返回 200 并取到封面”需配置 token 并重启 dev 后复测 |
+| R18 封面实际展示 | ⚠️ **未验证** | 依赖上一项；匿名状态下上游 404，前端仍显示「无封面」占位（与门禁移除前一致） |
+| 1 天 404 负缓存到期后自动重试 | ⚠️ 未做时间旅行验证 | 由单测覆盖（v3 TTL 用例），线上未等待 24 h |
+
+#### 8.10.8 结论
+
+| 项 | 结论 | 依据 |
+| --- | --- | --- |
+| 门禁移除 | ✅ 无回归 | 代码无 `Subject.nsfw` 查询；首页仍 47 封面 / 3 占位 / 0 裂图 / 0 console；meta 不变 |
+| 可选 token | ✅ 代码正确（端到端未验证） | header 构造独立验证 + 单测；未设 token 时匿名 |
+| 缓存 v3 迁移 | ✅ 已生效 | `user_version=3`、`reason` 列存在、负缓存清空后仅新增 4 条 `not_found`、正缓存 652 条保留 |
+| 151 用例 / typecheck | ✅ | 11 文件 151 用例全绿（4.65 s）；tsc exit 0 |
+| 上游 404 行为 | ✅ 已复核 | 匿名 NSFW 404、普通 200；移除门禁不改变匿名部署的可见结果 |
+
+**最终结论：本轮（V1.3）无回归。** 当前状态 = **NSFW 门禁已移除，但匿名 API 对 NSFW 仍返回 404，因此页面仍是「无封面」占位**；若要展示 R18 封面，必须提供 `BGM_API_TOKEN` 并**重启 dev** 后复测（本轮按约束未设置 token，该端到端路径标注为未验证）。§8.8.2 的 P1（NSFW 先于缓存校验）随门禁移除而自然失效——NSFW 与普通条目已同路径，是否返回封面完全取决于上游是否认证，不构成回归。

@@ -4,7 +4,6 @@ import {
   COVER_IDS_MAX,
   type CoverUrls,
 } from "~/shared/subject-contract";
-import { db } from "~/server/db";
 
 import {
   CoverCache,
@@ -51,8 +50,10 @@ export const COVER_BREAKER_COOLDOWN_MS = 30_000;
  */
 export const COVER_RETRY_MIN_DELAY_MS = 300;
 export const COVER_RETRY_MAX_DELAY_MS = 600;
-/** 负缓存 TTL：无封面 / NSFW / 404。正缓存永久。 */
+/** 负缓存 TTL：200 但无图 / unknown（7 天）。404 单独 1 天，便于补 token 后重试。 */
 export const COVER_NEGATIVE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/** 上游 404 的负缓存 TTL：NSFW 未认证也返回 404，配 token 后 1 天内可自动重试。 */
+export const COVER_NOT_FOUND_TTL_MS = 24 * 60 * 60 * 1000;
 
 /** 外部取数函数：返回官方响应里的 `images` 字段本身；404 抛 `CoverNotFoundError`。 */
 export type CoverFetcher = (id: number, signal: AbortSignal) => Promise<unknown>;
@@ -78,6 +79,8 @@ export interface CoverServiceOptions {
   breakerThreshold?: number;
   breakerCooldownMs?: number;
   negativeTtlMs?: number;
+  /** 404 负缓存 TTL（默认 1 天）。 */
+  notFoundTtlMs?: number;
   /** 重试退避毫秒数（默认 300–600ms 随机）；测试注入 0 避免等待。 */
   retryDelayMs?: () => number;
   /** 生成单请求超时信号；测试可注入无定时器的实现，避免挂起进程。 */
@@ -87,6 +90,10 @@ export interface CoverServiceOptions {
 }
 
 export interface CoverService {
+  /**
+   * `client` 仅为兼容 tRPC router 签名保留；产品已取消封面 NSFW 限制，
+   * 实现不再查询 `Subject.nsfw`，该参数不使用。
+   */
   getCovers(
     ids: number[],
     client?: PrismaClient,
@@ -112,15 +119,12 @@ export class CoverHttpError extends Error {
   }
 }
 
-interface NsfwRow {
-  id: number | bigint;
-  nsfw: boolean | number | bigint;
-}
-
 interface FetchOutcome {
   urls: CoverUrls | null;
   /** `true` = 确定结果（有封面 / 无封面 / 404），可写缓存。 */
   cacheable: boolean;
+  /** 负缓存原因：404 与 200 无图使用不同 TTL。 */
+  reason?: "ok" | "no_image" | "not_found";
   /** 重试后仍失败（网络/超时/5xx），不写缓存。 */
   failed: boolean;
   /** 首次失败后确实发起过重试。 */
@@ -291,6 +295,7 @@ class CoverServiceEngine implements CoverService {
   private readonly breakerThreshold: number;
   private readonly breakerCooldownMs: number;
   private readonly negativeTtlMs: number;
+  private readonly notFoundTtlMs: number;
   private readonly retryDelayMs: () => number;
   private readonly createTimeoutSignal: (timeoutMs: number) => AbortSignal;
   private readonly warn: (message: string, error?: unknown) => void;
@@ -303,7 +308,7 @@ class CoverServiceEngine implements CoverService {
   private halfOpenProbeInFlight = false;
 
   constructor(options: CoverServiceOptions) {
-    this.fetcher = options.fetcher ?? defaultCoverFetcher;
+    this.fetcher = options.fetcher ?? fetchCoverFromBangumi;
     this.clock = options.clock ?? realClock;
     this.cachePath = options.cachePath ?? DEFAULT_COVER_CACHE_PATH;
     this.gate = new RequestGate(
@@ -318,6 +323,7 @@ class CoverServiceEngine implements CoverService {
     this.breakerCooldownMs =
       options.breakerCooldownMs ?? COVER_BREAKER_COOLDOWN_MS;
     this.negativeTtlMs = options.negativeTtlMs ?? COVER_NEGATIVE_TTL_MS;
+    this.notFoundTtlMs = options.notFoundTtlMs ?? COVER_NOT_FOUND_TTL_MS;
     this.retryDelayMs =
       options.retryDelayMs ??
       (() =>
@@ -338,13 +344,13 @@ class CoverServiceEngine implements CoverService {
 
   async getCovers(
     ids: number[],
-    client?: PrismaClient,
+    _client?: PrismaClient,
   ): Promise<Record<string, CoverUrls | null>> {
     const uniqueIds = sanitizeIds(ids);
     if (uniqueIds.length === 0) return {};
 
     try {
-      return await this.resolveCovers(uniqueIds, client);
+      return await this.resolveCovers(uniqueIds);
     } catch (error) {
       // 兜底：缓存/解析/任何意外都不允许把错误抛给前端。
       this.warn("[cover] 封面解析整体失败，本批降级为无封面", error);
@@ -364,39 +370,19 @@ class CoverServiceEngine implements CoverService {
 
   private async resolveCovers(
     ids: readonly number[],
-    client?: PrismaClient,
   ): Promise<Record<string, CoverUrls | null>> {
     const now = this.clock.now();
-
-    // 0) NSFW 必须先于缓存命中判定。若先读缓存，历史正向缓存（预热 / dump 重导后
-    //    nsfw 由 0 变 1）会绕过检查，把 NSFW 封面直接返回给卡片。
-    const nsfwFlags = await this.lookupNsfwFlags(ids, client);
-    if (nsfwFlags === null) {
-      // 失败关闭：查不到 NSFW 标记时连正向缓存也不返回，整批不回源。
-      return toRecord(ids, new Map());
-    }
-
     const resolved = new Map<number, CoverUrls | null>();
-    const writes: CoverCacheWrite[] = [];
-    const pending: number[] = [];
-    for (const id of ids) {
-      if (nsfwFlags.get(id) === true) {
-        resolved.set(id, null);
-        // 覆盖可能存在的旧正缓存，避免下次命中旧 URL
-        writes.push({ id, urls: null, fetchedAt: now });
-      } else {
-        pending.push(id);
-      }
-    }
 
-    // 1) 本地缓存（含负缓存），只处理已确认非 NSFW 的 id
+    // 1) 本地缓存（含负缓存）。产品已取消封面 NSFW 限制，NSFW id 与普通 id 同路径。
     const cache = this.getCache();
     if (cache) {
       try {
         for (const [id, entry] of cache.getMany(
-          pending,
+          ids,
           now,
           this.negativeTtlMs,
+          this.notFoundTtlMs,
         )) {
           resolved.set(id, entry.missing ? null : pickCoverUrls(entry));
         }
@@ -405,26 +391,26 @@ class CoverServiceEngine implements CoverService {
       }
     }
 
-    const fetchable = pending.filter((id) => !resolved.has(id));
-    if (fetchable.length === 0) {
-      this.writeCache(writes);
-      return toRecord(ids, resolved);
-    }
+    const fetchable = ids.filter((id) => !resolved.has(id));
+    if (fetchable.length === 0) return toRecord(ids, resolved);
 
     // 2) 熔断打开（冷却中）或半开探测在飞：未命中的 id 直接 null，不再请求
-    if (this.isBreakerBlockingAll(now)) {
-      this.writeCache(writes);
-      return toRecord(ids, resolved);
-    }
+    if (this.isBreakerBlockingAll(now)) return toRecord(ids, resolved);
 
-    // 3) 只对未命中的非 NSFW 条目回源；单条失败不影响其它 id
+    // 3) 只对缓存未命中的条目回源；单条失败不影响其它 id
     const outcomes = await Promise.all(
       fetchable.map(async (id) => ({ id, outcome: await this.fetchOne(id) })),
     );
+    const writes: CoverCacheWrite[] = [];
     for (const { id, outcome } of outcomes) {
       resolved.set(id, outcome.urls);
       if (outcome.cacheable) {
-        writes.push({ id, urls: outcome.urls, fetchedAt: this.clock.now() });
+        writes.push({
+          id,
+          urls: outcome.urls,
+          fetchedAt: this.clock.now(),
+          reason: outcome.reason,
+        });
       }
     }
 
@@ -458,12 +444,20 @@ class CoverServiceEngine implements CoverService {
     const first = await this.attempt(id, admission.probe);
     if (first.kind === "success") {
       this.recordSuccess(admission);
-      return this.outcome(pickCoverUrls(first.images), true, false, false, false);
+      const urls = pickCoverUrls(first.images);
+      return this.outcome(
+        urls,
+        true,
+        false,
+        false,
+        false,
+        urls ? "ok" : "no_image",
+      );
     }
     if (first.kind === "notFound") {
-      // 404 是确定结果：不重试、写负缓存；算一次正常完成并清零连续失败
+      // 404 是确定结果：不重试、写 1 天负缓存；算一次正常完成并清零连续失败
       this.recordSuccess(admission);
-      return this.outcome(null, true, false, false, false);
+      return this.outcome(null, true, false, false, false, "not_found");
     }
     if (first.kind === "skipped") {
       return this.outcome(null, false, false, false, true);
@@ -487,11 +481,12 @@ class CoverServiceEngine implements CoverService {
     const second = await this.attempt(id, false);
     if (second.kind === "success") {
       this.recordSuccess(admission);
-      return this.outcome(pickCoverUrls(second.images), true, false, true, false);
+      const urls = pickCoverUrls(second.images);
+      return this.outcome(urls, true, false, true, false, urls ? "ok" : "no_image");
     }
     if (second.kind === "notFound") {
       this.recordSuccess(admission);
-      return this.outcome(null, true, false, true, false);
+      return this.outcome(null, true, false, true, false, "not_found");
     }
     if (second.kind === "skipped") {
       return this.outcome(null, false, true, false, false);
@@ -507,8 +502,9 @@ class CoverServiceEngine implements CoverService {
     failed: boolean,
     retried: boolean,
     skipped: boolean,
+    reason?: "ok" | "no_image" | "not_found",
   ): FetchOutcome {
-    return { urls, cacheable, failed, retried, skipped };
+    return { urls, cacheable, failed, retried, skipped, reason };
   }
 
   /** 单次外部请求；被熔断拦下时返回 skipped（不发请求、不计失败）。 */
@@ -524,30 +520,6 @@ class CoverServiceEngine implements CoverService {
     } catch (error) {
       if (error instanceof CoverNotFoundError) return { kind: "notFound" };
       return { kind: "error", error };
-    }
-  }
-
-  private async lookupNsfwFlags(
-    ids: readonly number[],
-    client?: PrismaClient,
-  ): Promise<Map<number, boolean> | null> {
-    if (ids.length === 0) return new Map();
-    const placeholders = ids.map(() => "?").join(", ");
-    const prisma = client ?? db;
-    try {
-      const rows = await prisma.$queryRawUnsafe<NsfwRow[]>(
-        `SELECT id, nsfw FROM "Subject" WHERE id IN (${placeholders})`,
-        ...ids,
-      );
-      const flags = new Map<number, boolean>();
-      for (const row of rows) {
-        flags.set(Number(row.id), Boolean(Number(row.nsfw)));
-      }
-      return flags;
-    } catch (error) {
-      // 查不到 NSFW 标记时宁可整批不取（含正向缓存），也不误取 NSFW 封面。
-      this.warn("[cover] 查询 Subject.nsfw 失败，本批不取封面", error);
-      return null;
     }
   }
 
@@ -641,16 +613,29 @@ class CoverServiceEngine implements CoverService {
   }
 }
 
-/** 默认 fetcher：带 UA、5s 超时，从 `/v0/subjects/{id}` 取 `images`。 */
-async function defaultCoverFetcher(
+/**
+ * 构造官方 API 请求头。`BGM_API_TOKEN` 存在时附加 Bearer token（仅发往
+ * api.bgm.tv，不落日志、不写缓存）；未配置时保持匿名请求。
+ */
+export function buildCoverRequestHeaders(
+  token: string | undefined = process.env.BGM_API_TOKEN,
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    "User-Agent": COVER_USER_AGENT,
+    Accept: "application/json",
+  };
+  const trimmed = token?.trim();
+  if (trimmed) headers.Authorization = `Bearer ${trimmed}`;
+  return headers;
+}
+
+/** 默认 fetcher：带 UA / 可选 token、5s 超时，从 `/v0/subjects/{id}` 取 `images`。 */
+export async function fetchCoverFromBangumi(
   id: number,
   signal: AbortSignal,
 ): Promise<unknown> {
   const response = await fetch(`${COVER_API_BASE}/${id}`, {
-    headers: {
-      "User-Agent": COVER_USER_AGENT,
-      Accept: "application/json",
-    },
+    headers: buildCoverRequestHeaders(),
     signal,
     cache: "no-store",
   });

@@ -1,30 +1,28 @@
 /**
- * `cover-service` 单测：全部使用 fake fetcher + 假时钟，缓存用 `:memory:` 或临时
- * 文件（`tmpdir`），不联网、不碰真实 `.cache/covers.db` / `prisma/dev.db`。
+ * `cover-service` 单测：全部使用 fake fetcher + 假时钟 + `:memory:` 缓存，
+ * 不联网、不碰真实 `.cache/covers.db` / `prisma/dev.db`。
  */
 
 import type { PrismaClient } from "@prisma/client";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   COVER_IDS_MAX,
   type CoverUrls,
 } from "~/shared/subject-contract";
 
-import { CoverCache } from "./cover-cache";
 import {
   COVER_BREAKER_COOLDOWN_MS,
   COVER_BREAKER_THRESHOLD,
   COVER_BURST_CAPACITY,
   COVER_MAX_CONCURRENCY,
   COVER_NEGATIVE_TTL_MS,
+  COVER_NOT_FOUND_TTL_MS,
   COVER_REQUESTS_PER_SECOND,
   CoverHttpError,
   CoverNotFoundError,
   createCoverService,
+  fetchCoverFromBangumi,
   pickCoverUrls,
   type CoverClock,
   type CoverFetcher,
@@ -74,7 +72,7 @@ function createFetcher(
   return { fetcher, calls };
 }
 
-/** 只回答 NSFW 标记的假 Prisma（`$queryRawUnsafe` 收到的是 id 参数列表）。 */
+/** 兼容 getCovers 签名用的假 Prisma；服务已不再查询 Subject.nsfw。 */
 function createFakePrisma(nsfwIds: readonly number[] = []): PrismaClient {
   const nsfw = new Set(nsfwIds);
   return {
@@ -87,14 +85,6 @@ function createFakePrisma(nsfwIds: readonly number[] = []): PrismaClient {
 }
 
 const services: CoverService[] = [];
-const tempDirs: string[] = [];
-
-/** 临时真实文件缓存（用于「缓存已存在」场景），绝不碰线上 `.cache/covers.db`。 */
-function createTempCachePath(): string {
-  const dir = mkdtempSync(join(tmpdir(), "bgm-cover-test-"));
-  tempDirs.push(dir);
-  return join(dir, "covers.db");
-}
 
 function createTestService(options: CoverServiceOptions = {}): {
   service: CoverService;
@@ -116,9 +106,8 @@ function createTestService(options: CoverServiceOptions = {}): {
 
 afterEach(() => {
   for (const service of services.splice(0)) service.close();
-  for (const dir of tempDirs.splice(0)) {
-    rmSync(dir, { recursive: true, force: true });
-  }
+  vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
 });
 
 describe("pickCoverUrls", () => {
@@ -244,6 +233,41 @@ describe("cover-service 缓存", () => {
     expect(calls).toEqual([9]);
   });
 
+  it("404 负缓存 TTL 1 天：过期后重新请求", async () => {
+    const { fetcher, calls } = createFetcher(() => {
+      throw new CoverNotFoundError(19);
+    });
+    const { service, clock } = createTestService({ fetcher });
+
+    await service.getCovers([19], createFakePrisma());
+    expect(calls).toHaveLength(1);
+
+    clock.advance(COVER_NOT_FOUND_TTL_MS - 1_000);
+    await service.getCovers([19], createFakePrisma());
+    expect(calls).toHaveLength(1);
+
+    clock.advance(2_000);
+    await service.getCovers([19], createFakePrisma());
+    expect(calls).toHaveLength(2);
+  });
+
+  it("无图负缓存不会被 404 的 1 天 TTL 提前清掉", async () => {
+    const { fetcher, calls } = createFetcher(() => ({
+      grid: "",
+      small: "",
+      common: "",
+    }));
+    const { service, clock } = createTestService({ fetcher });
+
+    await service.getCovers([29], createFakePrisma());
+    expect(calls).toHaveLength(1);
+
+    // 超过 404 的 1 天 TTL，但仍远小于无图的 7 天 TTL
+    clock.advance(COVER_NOT_FOUND_TTL_MS + 60 * 60 * 1000);
+    await service.getCovers([29], createFakePrisma());
+    expect(calls).toHaveLength(1);
+  });
+
   it("临时网络失败不写负缓存，下次会重试", async () => {
     let broken = true;
     const { fetcher, calls } = createFetcher((id) => {
@@ -278,85 +302,66 @@ describe("cover-service 缓存", () => {
   });
 });
 
-describe("cover-service NSFW", () => {
-  it("NSFW 条目不回源，直接 null 并写负缓存", async () => {
+describe("cover-service NSFW 策略（已取消限制）", () => {
+  it("NSFW id 与普通 id 一样回源并返回 URL，且不再查询 Subject.nsfw", async () => {
     const { fetcher, calls } = createFetcher((id) => coverUrls(id));
     const { service } = createTestService({ fetcher });
-    const db = createFakePrisma([1]);
-
-    const result = await service.getCovers([1, 2], db);
-    expect(calls).toEqual([2]);
-    expect(result["1"]).toBeNull();
-    expect(result["2"]).toEqual(coverUrls(2));
-
-    // 已写负缓存，第二次连 NSFW 查询都不再产生请求
-    expect(await service.getCovers([1], db)).toEqual({ "1": null });
-    expect(calls).toEqual([2]);
-  });
-
-  it("NSFW 标记查询失败时失败关闭：本批不回源、不抛错", async () => {
-    const { fetcher, calls } = createFetcher((id) => coverUrls(id));
-    const { service } = createTestService({ fetcher });
-    const broken = {
+    let queried = false;
+    const client = {
       $queryRawUnsafe: async () => {
-        throw new Error("db down");
+        queried = true;
+        throw new Error("should not query Subject.nsfw");
       },
     } as unknown as PrismaClient;
 
-    await expect(service.getCovers([1, 2], broken)).resolves.toEqual({
-      "1": null,
-      "2": null,
-    });
-    expect(calls).toHaveLength(0);
+    const result = await service.getCovers([22290, 226254], client);
+
+    expect(queried).toBe(false);
+    expect([...calls].sort((a, b) => a - b)).toEqual([22290, 226254]);
+    expect(result["22290"]).toEqual(coverUrls(22290));
+    expect(result["226254"]).toEqual(coverUrls(226254));
   });
 });
 
-describe("cover-service P1 回归：正向缓存不能绕过 NSFW", () => {
-  it("已有正向缓存的 id 变为 NSFW 时返回 null，且旧 URL 被负缓存覆盖", async () => {
-    const cachePath = createTempCachePath();
-    const seed = new CoverCache(cachePath);
-    seed.setMany([
-      { id: 22290, urls: coverUrls(22290), fetchedAt: Date.now() },
-    ]);
-    seed.close();
+describe("cover-service token", () => {
+  function mockFetch(): ReturnType<typeof vi.fn> {
+    return vi.fn(
+      async () =>
+        new Response(JSON.stringify({ images: coverUrls(1) }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+  }
 
-    const { fetcher, calls } = createFetcher((id) => coverUrls(id));
-    const { service, clock } = createTestService({ fetcher, cachePath });
+  it("BGM_API_TOKEN 存在时请求头带 Authorization: Bearer", async () => {
+    vi.stubEnv("BGM_API_TOKEN", "secret-token");
+    const fetchMock = mockFetch();
+    vi.stubGlobal("fetch", fetchMock);
 
-    const result = await service.getCovers([22290], createFakePrisma([22290]));
-    expect(result).toEqual({ "22290": null });
-    expect(calls).toHaveLength(0);
+    const images = await fetchCoverFromBangumi(
+      1,
+      new AbortController().signal,
+    );
+    expect(images).toEqual(coverUrls(1));
 
-    // 旧正缓存必须被负缓存覆盖，避免下次又命中旧 URL
-    service.close();
-    const reopened = new CoverCache(cachePath);
-    const entry = reopened
-      .getMany([22290], clock.now(), COVER_NEGATIVE_TTL_MS)
-      .get(22290);
-    expect(entry?.missing).toBe(true);
-    expect(entry?.grid).toBeNull();
-    reopened.close();
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit | undefined;
+    const headers = (init?.headers ?? {}) as Record<string, string>;
+    expect(headers.Authorization).toBe("Bearer secret-token");
+    expect(headers["User-Agent"]).toContain("bgm-filter");
   });
 
-  it("NSFW 查询失败时，即使有正向缓存也失败关闭返回 null", async () => {
-    const cachePath = createTempCachePath();
-    const seed = new CoverCache(cachePath);
-    seed.setMany([
-      { id: 22290, urls: coverUrls(22290), fetchedAt: Date.now() },
-    ]);
-    seed.close();
+  it("BGM_API_TOKEN 未配置时不带 Authorization", async () => {
+    vi.stubEnv("BGM_API_TOKEN", "");
+    const fetchMock = mockFetch();
+    vi.stubGlobal("fetch", fetchMock);
 
-    const { fetcher, calls } = createFetcher((id) => coverUrls(id));
-    const { service } = createTestService({ fetcher, cachePath });
-    const broken = {
-      $queryRawUnsafe: async () => {
-        throw new Error("db down");
-      },
-    } as unknown as PrismaClient;
+    await fetchCoverFromBangumi(1, new AbortController().signal);
 
-    const result = await service.getCovers([22290], broken);
-    expect(result).toEqual({ "22290": null });
-    expect(calls).toHaveLength(0);
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit | undefined;
+    const headers = (init?.headers ?? {}) as Record<string, string>;
+    expect(headers).not.toHaveProperty("Authorization");
+    expect(headers["User-Agent"]).toContain("bgm-filter");
   });
 });
 
