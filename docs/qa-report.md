@@ -674,6 +674,8 @@ total = 656
 | R18 封面实际展示 | ⚠️ **未验证** | 依赖上一项；匿名状态下上游 404，前端仍显示「无封面」占位（与门禁移除前一致） |
 | 1 天 404 负缓存到期后自动重试 | ⚠️ 未做时间旅行验证 | 由单测覆盖（v3 TTL 用例），线上未等待 24 h |
 
+> **状态更新（2026-11-03 20:47）**：以上 token 端到端与 R18 展示两项已由 §8.11（V1.4）验证通过——配置 `BGM_API_TOKEN` 后 NSFW 封面可正常取得。
+
 #### 8.10.8 结论
 
 | 项 | 结论 | 依据 |
@@ -685,3 +687,115 @@ total = 656
 | 上游 404 行为 | ✅ 已复核 | 匿名 NSFW 404、普通 200；移除门禁不改变匿名部署的可见结果 |
 
 **最终结论：本轮（V1.3）无回归。** 当前状态 = **NSFW 门禁已移除，但匿名 API 对 NSFW 仍返回 404，因此页面仍是「无封面」占位**；若要展示 R18 封面，必须提供 `BGM_API_TOKEN` 并**重启 dev** 后复测（本轮按约束未设置 token，该端到端路径标注为未验证）。§8.8.2 的 P1（NSFW 先于缓存校验）随门禁移除而自然失效——NSFW 与普通条目已同路径，是否返回封面完全取决于上游是否认证，不构成回归。
+
+---
+
+### 8.11 BGM 客户端收口与 token 鉴权（V1.4）
+
+> 复验时间：2026-11-03 20:47–21:02；QA **未重启 dev、未改 `src/**`、未 `pnpm add`**；token 全程**未打印**（仅输出长度/计数），报告不含 token 值。
+> **环境说明**：本轮开始时 dev 已是新进程 **PID 101488（20:36:34 启动）**，原 PID 41075 已退出——该重启由实现方在验收前完成（**非 QA 操作**），也是 `.env.local` 中 token 得以加载的前提；验收期间未再重启。
+
+#### 8.11.1 质量门禁（实测）
+
+```text
+$ pnpm test
+ Test Files  12 passed (12)
+      Tests  161 passed (161)        # 较 §8.10 的 151 +10：新增 bgm-client.test.ts
+   Duration  4.78s (transform 285ms, setup 0ms, collect 618ms, tests 4.70s, environment 2ms)
+$ pnpm typecheck
+$ tsc --noEmit                        # 无输出，exit 0
+```
+
+| 项 | 结果 |
+| --- | --- |
+| `pnpm test` | ✅ 12 文件 / **161 用例**全绿（4.78 s） |
+| `pnpm typecheck` | ✅ exit 0，0 error |
+| 新增用例文件 | ✅ `src/server/bgm/bgm-client.test.ts`（含 token 读取/覆盖、404→null、错误类、限速、重试、熔断、相对路径限制等） |
+
+#### 8.11.2 架构收口（grep 实测）
+
+| 检查 | 命令 | 实测结果 |
+| --- | --- | --- |
+| `fetch(` 收口 | `grep -rn "fetch(" src/server --include=*.ts`（排除测试） | **仅 1 处**：`src/server/bgm/bgm-client.ts:285` |
+| `BGM_API_TOKEN` 分布 | `grep -rn "BGM_API_TOKEN" src/` | `bgm-client.ts`（注释 7、选项注释 74、默认读取 266）、`bgm-client.test.ts`（129/130 用例）、`cover-cache.ts:20`（历史注释）。**无客户端文件** |
+| `Authorization` / `Bearer` 分布 | `grep -rn "Authorization\|Bearer" src/`（排除测试） | **仅 `bgm-client.ts`**（298/386/389），cover-service 无 |
+| 客户端文件引用密钥 | 遍历所有含 `"use client"` 的 `src` 文件 | **0 个文件**出现 `BGM_API_TOKEN` / `Authorization` |
+| cover-service 注入 | 读代码 | `import { bgmClient, type BgmClient } from "~/server/bgm/bgm-client"`；`type CoverClient = Pick<BgmClient, "getSubject">`；`private readonly client: CoverClient`；`this.client = options.client ?? bgmClient`（测试可注入 fake）；`fetchOne` 调用 `client.getSubject(id)` |
+| 路由不再传 DB | `src/server/api/routers/subject.ts` | `getCovers(input.ids)`，**无 `ctx.db`**，注释写明“外部请求统一走 bgmClient” |
+
+`bgm-client.ts` 内部与声称一致：`BGM_API_BASE_URL`、`BGM_USER_AGENT`、`BGM_REQUEST_TIMEOUT_MS=5_000`、`BGM_REQUESTS_PER_SECOND=4`、`BGM_BURST_CAPACITY=4`、`BGM_MAX_CONCURRENCY=5`、`BGM_RETRY_MIN/MAX_DELAY_MS=300/600`、`BGM_BREAKER_THRESHOLD=10`、`BGM_BREAKER_COOLDOWN_MS=30_000`；`BgmHttpError`/`BgmNetworkError`/`BgmCircuitOpenError` 三个错误类；`getSubject` 404→`null`；`token` 为 `private readonly`；异常/日志路径经 `redact()` 把 token 替换为 `[redacted]`；`buildUrl` 拒绝绝对 URL（防 token 发往他处）。
+
+#### 8.11.3 鉴权生效（线上接口）
+
+| 请求 | 结果 | 耗时 |
+| --- | --- | --- |
+| `ids=[22290,4639,62229]`（首次） | **三个都有 lain.bgm.tv URL**（22290 `/r/200/.../22290_1L2aJ.jpg`、4639 `.../4639_kDq7d.jpg`、62229 `.../62229_5Yt0j.jpg`） | 216 ms |
+| 同上（暖缓存重复） | 三个 URL | **20.9 ms**（<50 ms ✅） |
+| `ids=[99999999]` | `{"99999999":null}` | 首次 **2.0 s**（dev 首次实网请求含编译 + 上游 404），重复 **11 ms**（负缓存） |
+| `ids=[22423]`（匿名上游 **404**） | 返回 `small=https://lain.bgm.tv/r/200/pic/cover/l/71/f7/22423_SksK2.jpg` | **512 ms** |
+| `ids=[172612]`（NSFW，未缓存） | 返回三尺寸 URL | **278 ms** |
+
+匿名对照：`22423` 404、`172612` 200、`113290` 200——上游对 NSFW 的隐藏**并非**严格对应本地 `nsfw` 标记，因此 `22423`（匿名 404 → 应用 200）是 **token 真实生效**的直接证据，而非缓存或上游放宽所致。
+
+#### 8.11.4 页面回归（Playwright 自跑 1440×1000）
+
+| 指标 | 实测 |
+| --- | --- |
+| 卡片数 | 50 |
+| 封面数（`/r/200/`） | **50**（全部 `complete && naturalWidth>0`） |
+| 占位数 | **0** |
+| 裂图 | **0** |
+| console error / pageerror | **0 / 0** |
+| 3 个原 NSFW 卡（226254、22290、424578） | **均有已加载封面**（token 生效后不再占位） |
+| 首卡 meta | `9.4 · 7,154 人评分 #1 看过 8,342`（未变） |
+| 首卡 | ゼルダの伝説 ブレス オブ ザ ワイルド（排序未变，前 5 id：62229、18462、238923、16261、226254） |
+| 卡内 `.text-2xl` / 链接 | 0 / 50-50 `bgm.tv/subject/{id}` + `_blank` |
+| 50 条文字 / 首图 | 999 ms / 1,188 ms |
+
+#### 8.11.5 密钥不泄漏（重点）
+
+| 检查 | 方法 | 结果 |
+| --- | --- | --- |
+| 源码分布 | `grep -rn "BGM_API_TOKEN" src/` | 仅服务端 `bgm-client.ts` + 测试 + 1 条历史注释；**无 `"use client"` 文件** |
+| 页面 HTML | `curl -s http://127.0.0.1:7737/`（87,004 B）后统计 | `BGM_API_TOKEN` **0**、`Bearer ` **0**、token 值 **0** |
+| 客户端 chunk | `grep -rl "BGM_API_TOKEN" .next/static` / 按 token 值检索 | **0 个文件 / 0 个文件** |
+| 服务端 bundle | 按 token 值检索 `.next/server` | **0 个文件** |
+| 全仓检索 | 排除 `node_modules/.next/.cache/dump-db/.git` 后按 token 值检索 | **仅 1 个文件：`.env.local`** |
+| `.env.local` 入库风险 | `git check-ignore -v .env.local` | ✅ 命中 `.gitignore:28:.env*.local`，**未被跟踪**；权限 `664` |
+| 其他 env 文件 | `git ls-files .env .env.template` + 键名检查 | `.env`/`.env.template` 虽被跟踪，但**只含 `DATABASE_URL`**，无 token |
+
+token 长度 40，仅用于计数比对；全程未回显、未写入报告/缓存/日志。
+
+#### 8.11.6 缓存实查（只读）
+
+```text
+PRAGMA user_version → 3
+SELECT missing, reason, COUNT(*) → missing=0/reason=ok n=658；missing=1/reason=not_found n=1
+22290: missing=0, reason=ok, small 非空   ✅
+4639 : missing=0, reason=ok, small 非空   ✅
+99999999: missing=1, reason=not_found     （不存在 id，符合预期）
+```
+
+token 生效后，原 NSFW 负缓存已被正向缓存覆盖（`fetchedAt` 更新为 20:44 前后），符合 v3 设计。
+
+#### 8.11.7 未验证项与风险
+
+| 项 | 状态 | 说明 |
+| --- | --- | --- |
+| token 轮换 / 过期 / 401 | ⚠️ **未验证** | 当前 token 有效；无 401 场景可测。更换 token 需改 `.env.local` 并**重启 dev** 才生效（Next 仅在启动时加载 env 文件） |
+| 上游可见性波动 | ⚠️ 观察 | 抽样中 172612/113290 匿名也返回 200、22423 匿名 404 → 上游对 NSFW 的隐藏不等于本地 `nsfw` 标记；负缓存 TTL（404 1 天 / 无图 7 天）会延迟反映上游策略变化 |
+| dev 重启责任 | ℹ️ 说明 | 本轮 dev 的新进程由实现方在 20:36:34 启动；QA 未重启。部署/换 token 后必须重启，否则 token 不生效 |
+| `.env.local` 权限 | ⚠️ 建议 | 当前 `664`（组/其他可读），生产建议 `600`；已确认不入库 |
+
+#### 8.11.8 结论
+
+| 项 | 结论 | 依据 |
+| --- | --- | --- |
+| 161 用例 / typecheck | ✅ | 12 文件 161 用例全绿（4.78 s）；tsc exit 0 |
+| 架构收口 | ✅ | `fetch(`/`Authorization`/token 读取仅存在于 `bgm-client.ts`；cover-service 通过 `CoverClient` 注入；路由不再传 `ctx.db` |
+| token 鉴权生效 | ✅ | NSFW 三 id 全部出图；匿名 404 的 22423 经应用返回 URL（512 ms）；暖请求 20.9 ms |
+| 页面回归 | ✅ | **50 封面 / 0 占位 / 0 裂图 / 0 console / 0 pageerror**；meta 与排序未变 |
+| 密钥不泄漏 | ✅ | HTML、`.next/static`、`.next/server` 均 0；token 值仅存在于被 ignore 的 `.env.local` |
+| 缓存 | ✅ | `user_version=3`；22290/4639 `missing=0 reason=ok` |
+
+**最终结论：V1.4 无回归、未发现密钥泄漏、token 鉴权确认生效**；封面在此前所有验收项（P1/P2/v3）基础上进一步达到「首页 50 条全部出图、0 占位」。唯一需要注意的是 token 轮换/401 场景与部署重启要求（见 §8.11.7），不影响本次验收。

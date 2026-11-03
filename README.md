@@ -114,7 +114,9 @@ src/
 ├─ server/
 │  ├─ api/               # tRPC 初始化、root router、subject router
 │  ├─ tag-dsl/           # 标签表达式 parser / compiler（纯函数 + 单测）
-│  └─ search/            # SQL 组装、执行、DTO 映射（含真实数据集成测试）
+│  ├─ search/            # SQL 组装、执行、DTO 映射（含真实数据集成测试）
+│  ├─ bgm/               # BgmClient：所有 Bangumi 请求的唯一入口（UA/Token/限速/重试/熔断）
+│  └─ cover/             # 封面 URL 解析（注入 BgmClient）+ .cache/covers.db 缓存
 └─ shared/               # 前后端共享契约（zod schema + DTO 类型）
 scripts/                 # import-dump.mjs（导入）、verify-db.mjs（校验）
 prisma/                  # schema.prisma + dev.db（生成物）

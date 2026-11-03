@@ -93,8 +93,13 @@ Next.js App Router 页面 (/ 单页) ── tRPC ──▶ server/api/routers/su
 │  │  │  ├─ parser.ts        # 表达式 → AST（纯函数，无 IO）
 │  │  │  ├─ compiler.ts      # AST → { sql, params }（纯函数）
 │  │  │  └─ index.ts
-│  │  └─ search/
-│  │     └─ subject-search.ts# 组装 WHERE/ORDER BY、执行查询、DTO 映射
+│  │  ├─ search/
+│  │  │  └─ subject-search.ts# 组装 WHERE/ORDER BY、执行查询、DTO 映射
+│  │  ├─ bgm/
+│  │  │  └─ bgm-client.ts    # 所有 Bangumi 外部请求的唯一入口（UA/Token/限速/重试/熔断）
+│  │  └─ cover/
+│  │     ├─ cover-service.ts # 封面 URL 解析（注入 BgmClient）+ 失败降级
+│  │     └─ cover-cache.ts   # .cache/covers.db（node:sqlite，仅存 URL）
 │  ├─ trpc/
 │  │  ├─ react.tsx           # createTRPCReact
 │  │  └─ server.ts           # RSC caller（可选）
@@ -385,3 +390,20 @@ export type AppRouter = typeof appRouter;
 
 - 可运行代码（上述目录结构）、README（安装/导入/运行/命令）、`docs/data-report.md`、`docs/qa-report.md`。
 - 验收以 `docs/requirements.md` 第 6 节清单为准。
+
+## 12. 外部请求：`BgmClient`（V1.4）
+
+所有对 Bangumi 的 HTTP 请求（当前为封面 URL 解析，后续的搜索/人物等）**必须**经由 `src/server/bgm/bgm-client.ts`，不得在业务模块里直接 `fetch`、自行拼 `Authorization` 或各建限速器。
+
+```ts
+const bgmClient = new BgmClient();          // 单例；测试可注入替身
+bgmClient.getSubject(id);                    // 404 → null；返回 { id, name, name_cn, images }
+bgmClient.request<T>(path, init?);           // 通用 JSON 请求，仅接受相对路径
+```
+
+- **鉴权**：`token` 默认取 `process.env.BGM_API_TOKEN`（写入 `.env.local`，已被 gitignore）；非空时加 `Authorization: Bearer <token>`，为空则匿名。Bangumi 匿名 API 对 `nsfw=true` 条目返回 404，配置令牌后返回 200。
+- **超时/限速**：单请求 5s；令牌桶平均 4 req/s、突发 4、并发 5（官方 3000 次/10min，留 20% 余量）。
+- **重试/熔断**：网络/超时/408/429/5xx 重试 1 次（300–600ms jitter）；连续 10 次失败打开熔断 30s，半开只放行 1 个探测；404 不重试。
+- **错误模型**：`BgmHttpError(status, path)` / `BgmNetworkError(path)` / `BgmCircuitOpenError(path)`；确定性 4xx 不计入熔断。
+- **安全**：token 为私有字段，异常与日志脱敏、不打印；仅接受相对路径以防令牌被发往其它主机；不得出现在任何 `"use client"` 模块或客户端 bundle。
+- **封面**：`cover-service` 通过注入的 `BgmClient.getSubject` 取 URL，仅缓存 URL 到 `.cache/covers.db`（404 → `not_found` 1 天，200 空图 → `no_image` 7 天），图片由浏览器直连 `lain.bgm.tv`。

@@ -1,4 +1,21 @@
-import type { PrismaClient } from "@prisma/client";
+/**
+ * 封面 URL 解析服务。
+ *
+ * 产品决策：只解析并缓存「id → {grid,small,common} URL」，图片字节一律不落盘、
+ * 不经服务端代理，由浏览器直连 `lain.bgm.tv`。本模块因此只有字符串级缓存，
+ * 且**永不向前端抛错**：任何外部/缓存异常都降级为 `null`（卡片显示占位）。
+ *
+ * 所有 Bangumi 外部请求（UA / token / 超时 / 限速 / 并发 / 重试 / 熔断）都委托给
+ * `~/server/bgm/bgm-client`，本模块只保留输入清洗、缓存读写与 `images` 容错。
+ */
+
+import {
+  BgmCircuitOpenError,
+  BgmHttpError,
+  bgmClient,
+  type BgmClient,
+  type BgmSubject,
+} from "~/server/bgm/bgm-client";
 
 import {
   COVER_IDS_MAX,
@@ -11,112 +28,43 @@ import {
   type CoverCacheWrite,
 } from "./cover-cache";
 
-/**
- * 封面 URL 解析服务。
- *
- * 产品决策：只解析并缓存「id → {grid,small,common} URL」，图片字节一律不落盘、
- * 不经服务端代理，由浏览器直连 `lain.bgm.tv`。本模块因此只有字符串级缓存，
- * 且**永不向前端抛错**：任何外部/缓存/数据库异常都降级为 `null`（卡片显示占位）。
- */
-
-/** 官方 API 必须带可识别的 User-Agent，否则源站 403。 */
-export const COVER_USER_AGENT = "bgm-filter/1.0 (local personal tool)";
-export const COVER_API_BASE = "https://api.bgm.tv/v0/subjects";
-
-export const COVER_MAX_CONCURRENCY = 5;
-/**
- * 限速取舍：官方默认 3000 次 / 10 分钟 / IP，超限直接封禁 1 小时、响应头又没有任何
- * 限流信息，所以只能自我限速。这里用令牌桶取「平均 4 req/s + 突发 4 个」：
- * - 稳态 4 × 600 = 2400 次/10min，比官方额度留 20% 余量；
- * - 突发容量从 8 降到 4（P2）：冷启动时 4 个并发已够首图，避免瞬时打满 5 并发；
- *   前端每块 10 个 id，突发 4 个后按 250ms 补充，10 个约 1.5s；
- * - 并发仍限制 5，作为硬上限。
- * 50 张全冷启动约 (50-4)/4 ≈ 11.5s（再加最后一次请求耗时）。
- */
-export const COVER_REQUESTS_PER_SECOND = 4;
-export const COVER_BURST_CAPACITY = 4;
-export const COVER_REQUEST_TIMEOUT_MS = 5_000;
-/**
- * 熔断：以「连续无任何成功的外部尝试」计数（每次请求/重试各计 1，任何一次成功即清零）。
- * 达到 10 次才打开，打开 30s；过期后进入半开，只放行 1 个探测请求：
- * 成功 → 关闭并恢复正常；失败 → 重新计时 30s。阈值从 5 提到 10、时长 60s→30s，
- * 避免一批瞬时抖动（冷启动突发）被放大成整批 60s 无图。
- */
-export const COVER_BREAKER_THRESHOLD = 10;
-export const COVER_BREAKER_COOLDOWN_MS = 30_000;
-/**
- * 单 id 重试：仅网络错误 / 超时 / 5xx / 429（408 也算），最多重试 1 次；
- * 404 与「200 但 images 为空」都是确定结果，不重试。退避 300–600ms 随机 jitter。
- */
-export const COVER_RETRY_MIN_DELAY_MS = 300;
-export const COVER_RETRY_MAX_DELAY_MS = 600;
 /** 负缓存 TTL：200 但无图 / unknown（7 天）。404 单独 1 天，便于补 token 后重试。 */
 export const COVER_NEGATIVE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 /** 上游 404 的负缓存 TTL：NSFW 未认证也返回 404，配 token 后 1 天内可自动重试。 */
 export const COVER_NOT_FOUND_TTL_MS = 24 * 60 * 60 * 1000;
 
-/** 外部取数函数：返回官方响应里的 `images` 字段本身；404 抛 `CoverNotFoundError`。 */
-export type CoverFetcher = (id: number, signal: AbortSignal) => Promise<unknown>;
+/** 封面服务所需的最小客户端能力（便于测试注入 fake）。 */
+export type CoverClient = Pick<BgmClient, "getSubject">;
 
-/** 可注入时钟，便于单测虚拟时间（TTL / 限速 / 熔断冷却）。 */
+/** 可注入时钟，便于单测虚拟时间（缓存 TTL）。 */
 export interface CoverClock {
   now(): number;
-  sleep(ms: number): Promise<void>;
 }
 
 export interface CoverServiceOptions {
-  /** 默认 `fetch` + UA；测试注入 fake fetcher，绝不联网。 */
-  fetcher?: CoverFetcher;
+  /** 默认生产单例 `bgmClient`；测试注入 fake，绝不联网。 */
+  client?: CoverClient;
   clock?: CoverClock;
   /** 默认 `.cache/covers.db`；测试用 `:memory:`。 */
   cachePath?: string;
-  maxConcurrency?: number;
-  /** 令牌桶平均速率（req/s）。 */
-  requestsPerSecond?: number;
-  /** 令牌桶容量，允许的瞬时突发请求数。 */
-  burstCapacity?: number;
-  timeoutMs?: number;
-  breakerThreshold?: number;
-  breakerCooldownMs?: number;
   negativeTtlMs?: number;
   /** 404 负缓存 TTL（默认 1 天）。 */
   notFoundTtlMs?: number;
-  /** 重试退避毫秒数（默认 300–600ms 随机）；测试注入 0 避免等待。 */
-  retryDelayMs?: () => number;
-  /** 生成单请求超时信号；测试可注入无定时器的实现，避免挂起进程。 */
-  createTimeoutSignal?: (timeoutMs: number) => AbortSignal;
   /** 日志出口；默认 `console.warn`，只在失败/熔断时调用。 */
   warn?: (message: string, error?: unknown) => void;
 }
 
+/** 单次调用可临时覆盖客户端（默认用构造时注入的那个）。 */
+export interface CoverServiceDeps {
+  client?: CoverClient;
+}
+
 export interface CoverService {
-  /**
-   * `client` 仅为兼容 tRPC router 签名保留；产品已取消封面 NSFW 限制，
-   * 实现不再查询 `Subject.nsfw`，该参数不使用。
-   */
   getCovers(
     ids: number[],
-    client?: PrismaClient,
+    deps?: CoverServiceDeps,
   ): Promise<Record<string, CoverUrls | null>>;
   close(): void;
-}
-
-export class CoverNotFoundError extends Error {
-  constructor(readonly subjectId: number) {
-    super(`subject ${subjectId} not found`);
-    this.name = "CoverNotFoundError";
-  }
-}
-
-/** 非 2xx 响应；用于区分可重试的 408/429/5xx 与不可重试的 4xx。 */
-export class CoverHttpError extends Error {
-  constructor(
-    readonly status: number,
-    readonly subjectId: number,
-  ) {
-    super(`Bangumi API ${status} for subject ${subjectId}`);
-    this.name = "CoverHttpError";
-  }
 }
 
 interface FetchOutcome {
@@ -127,42 +75,13 @@ interface FetchOutcome {
   reason?: "ok" | "no_image" | "not_found";
   /** 重试后仍失败（网络/超时/5xx），不写缓存。 */
   failed: boolean;
-  /** 首次失败后确实发起过重试。 */
-  retried: boolean;
   /** 因熔断已打开/半开而被跳过，未发外部请求。 */
   skipped: boolean;
 }
 
-/** 半开状态下由唯一探测请求持有。 */
-interface Admission {
-  probe: boolean;
-}
-
-type AttemptResult =
-  | { kind: "success"; images: unknown }
-  | { kind: "notFound" }
-  | { kind: "error"; error: unknown }
-  | { kind: "skipped" };
-
 const realClock: CoverClock = {
   now: () => Date.now(),
-  sleep: (ms) =>
-    new Promise<void>((resolve) => {
-      setTimeout(resolve, ms);
-    }),
 };
-
-const CIRCUIT_OPEN = Symbol("cover-circuit-open");
-
-/** 仅瞬时错误值得重试；404 与其它 4xx（如 403 UA 被拒）重试也不会变好。 */
-function isRetryableError(error: unknown): boolean {
-  if (error instanceof CoverNotFoundError) return false;
-  if (error instanceof CoverHttpError) {
-    return error.status === 408 || error.status === 429 || error.status >= 500;
-  }
-  // fetch TypeError / AbortSignal.timeout 的 TimeoutError / JSON 解析错误等
-  return true;
-}
 
 /**
  * 纯函数：把官方 `images` 对象转成契约里的三尺寸 URL。
@@ -205,135 +124,23 @@ function sanitizeIds(ids: readonly number[]): number[] {
   return result;
 }
 
-/**
- * 并发闸门 + 令牌桶限速：同时在途 ≤ maxConcurrency；启动速率受令牌桶约束
- * （初始 burstCapacity 个令牌，之后按 requestsPerSecond 补充）。
- */
-class RequestGate {
-  private active = 0;
-  private tokens: number;
-  private lastRefillAt: number;
-  private pumping = false;
-  private readonly waiters: Array<{
-    resolve: (release: () => void) => void;
-    reject: (error: unknown) => void;
-  }> = [];
-
-  constructor(
-    private readonly maxConcurrency: number,
-    private readonly requestsPerSecond: number,
-    private readonly burstCapacity: number,
-    private readonly clock: CoverClock,
-  ) {
-    this.tokens = burstCapacity;
-    this.lastRefillAt = clock.now();
-  }
-
-  run<T>(task: () => Promise<T>): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-      this.waiters.push({
-        resolve: (release) => {
-          void Promise.resolve()
-            .then(task)
-            .then(resolve, reject)
-            .finally(release);
-        },
-        reject,
-      });
-      void this.pump();
-    });
-  }
-
-  private refill(): void {
-    const now = this.clock.now();
-    const elapsedMs = Math.max(0, now - this.lastRefillAt);
-    if (elapsedMs <= 0) return;
-    this.tokens = Math.min(
-      this.burstCapacity,
-      this.tokens + (elapsedMs / 1000) * this.requestsPerSecond,
-    );
-    this.lastRefillAt = now;
-  }
-
-  private async pump(): Promise<void> {
-    if (this.pumping) return;
-    this.pumping = true;
-    try {
-      while (this.waiters.length > 0 && this.active < this.maxConcurrency) {
-        this.refill();
-        if (this.tokens < 1) {
-          const waitMs = Math.max(
-            1,
-            Math.ceil(
-              ((1 - this.tokens) / this.requestsPerSecond) * 1000,
-            ),
-          );
-          await this.clock.sleep(waitMs);
-          continue;
-        }
-        const waiter = this.waiters.shift();
-        if (!waiter) break;
-        this.tokens -= 1;
-        this.active += 1;
-        waiter.resolve(() => {
-          this.active -= 1;
-          void this.pump();
-        });
-      }
-    } finally {
-      this.pumping = false;
-    }
-  }
-}
-
 class CoverServiceEngine implements CoverService {
-  private readonly fetcher: CoverFetcher;
+  private readonly client: CoverClient;
   private readonly clock: CoverClock;
   private readonly cachePath: string;
-  private readonly gate: RequestGate;
-  private readonly timeoutMs: number;
-  private readonly breakerThreshold: number;
-  private readonly breakerCooldownMs: number;
   private readonly negativeTtlMs: number;
   private readonly notFoundTtlMs: number;
-  private readonly retryDelayMs: () => number;
-  private readonly createTimeoutSignal: (timeoutMs: number) => AbortSignal;
   private readonly warn: (message: string, error?: unknown) => void;
 
   private cache: CoverCache | null = null;
   private cacheFailed = false;
-  private consecutiveFailures = 0;
-  private breakerState: "closed" | "open" | "half-open" = "closed";
-  private circuitOpenUntil = 0;
-  private halfOpenProbeInFlight = false;
 
   constructor(options: CoverServiceOptions) {
-    this.fetcher = options.fetcher ?? fetchCoverFromBangumi;
+    this.client = options.client ?? bgmClient;
     this.clock = options.clock ?? realClock;
     this.cachePath = options.cachePath ?? DEFAULT_COVER_CACHE_PATH;
-    this.gate = new RequestGate(
-      options.maxConcurrency ?? COVER_MAX_CONCURRENCY,
-      options.requestsPerSecond ?? COVER_REQUESTS_PER_SECOND,
-      options.burstCapacity ?? COVER_BURST_CAPACITY,
-      this.clock,
-    );
-    this.timeoutMs = options.timeoutMs ?? COVER_REQUEST_TIMEOUT_MS;
-    this.breakerThreshold =
-      options.breakerThreshold ?? COVER_BREAKER_THRESHOLD;
-    this.breakerCooldownMs =
-      options.breakerCooldownMs ?? COVER_BREAKER_COOLDOWN_MS;
     this.negativeTtlMs = options.negativeTtlMs ?? COVER_NEGATIVE_TTL_MS;
     this.notFoundTtlMs = options.notFoundTtlMs ?? COVER_NOT_FOUND_TTL_MS;
-    this.retryDelayMs =
-      options.retryDelayMs ??
-      (() =>
-        COVER_RETRY_MIN_DELAY_MS +
-        Math.floor(
-          Math.random() *
-            (COVER_RETRY_MAX_DELAY_MS - COVER_RETRY_MIN_DELAY_MS + 1),
-        ));
-    this.createTimeoutSignal =
-      options.createTimeoutSignal ?? ((timeoutMs) => AbortSignal.timeout(timeoutMs));
     this.warn =
       options.warn ??
       ((message, error) => {
@@ -344,13 +151,16 @@ class CoverServiceEngine implements CoverService {
 
   async getCovers(
     ids: number[],
-    _client?: PrismaClient,
+    deps: CoverServiceDeps = {},
   ): Promise<Record<string, CoverUrls | null>> {
     const uniqueIds = sanitizeIds(ids);
     if (uniqueIds.length === 0) return {};
 
     try {
-      return await this.resolveCovers(uniqueIds);
+      return await this.resolveCovers(
+        uniqueIds,
+        deps.client ?? this.client,
+      );
     } catch (error) {
       // 兜底：缓存/解析/任何意外都不允许把错误抛给前端。
       this.warn("[cover] 封面解析整体失败，本批降级为无封面", error);
@@ -370,6 +180,7 @@ class CoverServiceEngine implements CoverService {
 
   private async resolveCovers(
     ids: readonly number[],
+    client: CoverClient,
   ): Promise<Record<string, CoverUrls | null>> {
     const now = this.clock.now();
     const resolved = new Map<number, CoverUrls | null>();
@@ -394,12 +205,13 @@ class CoverServiceEngine implements CoverService {
     const fetchable = ids.filter((id) => !resolved.has(id));
     if (fetchable.length === 0) return toRecord(ids, resolved);
 
-    // 2) 熔断打开（冷却中）或半开探测在飞：未命中的 id 直接 null，不再请求
-    if (this.isBreakerBlockingAll(now)) return toRecord(ids, resolved);
-
-    // 3) 只对缓存未命中的条目回源；单条失败不影响其它 id
+    // 2) 只对缓存未命中的条目回源；单条失败不影响其它 id。
+    //    限速/重试/熔断由 BgmClient 统一处理（熔断打开时这里会收到 skipped）。
     const outcomes = await Promise.all(
-      fetchable.map(async (id) => ({ id, outcome: await this.fetchOne(id) })),
+      fetchable.map(async (id) => ({
+        id,
+        outcome: await this.fetchOne(id, client),
+      })),
     );
     const writes: CoverCacheWrite[] = [];
     for (const { id, outcome } of outcomes) {
@@ -425,169 +237,57 @@ class CoverServiceEngine implements CoverService {
     total: number,
   ): void {
     const failed = outcomes.filter((item) => item.outcome.failed).length;
-    const retried = outcomes.filter((item) => item.outcome.retried).length;
     const skipped = outcomes.filter((item) => item.outcome.skipped).length;
     if (failed === 0 && skipped === 0) return;
     this.warn(
-      `[cover] 本批 ${failed}/${total} 条失败（已重试 ${retried} 条，未写缓存、下次可重试），` +
-        `${skipped} 条因熔断跳过；连续无成功 ${this.consecutiveFailures}/${this.breakerThreshold}`,
+      `[cover] 本批 ${failed}/${total} 条失败（未写缓存、下次可重试），` +
+        `${skipped} 条因熔断跳过`,
     );
   }
 
-  /** 取单条封面：瞬时错误重试 1 次；错误全部吞掉，只回报结果与是否可缓存。 */
-  private async fetchOne(id: number): Promise<FetchOutcome> {
-    const admission = this.admit(this.clock.now());
-    if (!admission) {
-      return this.outcome(null, false, false, false, true);
-    }
-
-    const first = await this.attempt(id, admission.probe);
-    if (first.kind === "success") {
-      this.recordSuccess(admission);
-      const urls = pickCoverUrls(first.images);
+  /**
+   * 取单条封面：`getSubject` 内部已完成重试/熔断；这里只把结果映射成
+   * 「可缓存 / 失败 / 跳过」三种状态，错误全部吞掉。
+   */
+  private async fetchOne(
+    id: number,
+    client: CoverClient,
+  ): Promise<FetchOutcome> {
+    try {
+      const subject: BgmSubject | null = await client.getSubject(id);
+      if (subject === null) {
+        // 404 是确定结果：写 1 天负缓存，便于补 token 后重试。
+        return this.outcome(null, true, false, false, "not_found");
+      }
+      const urls = pickCoverUrls(subject.images);
       return this.outcome(
         urls,
         true,
         false,
         false,
-        false,
         urls ? "ok" : "no_image",
       );
+    } catch (error) {
+      if (error instanceof BgmCircuitOpenError) {
+        // 熔断短路：没发外部请求，不能当成「无图」写缓存。
+        return this.outcome(null, false, true, true);
+      }
+      // 兼容客户端直接把 404 作为异常抛出的实现（默认 getSubject 已映射为 null）。
+      if (error instanceof BgmHttpError && error.status === 404) {
+        return this.outcome(null, true, false, false, "not_found");
+      }
+      return this.outcome(null, false, true, false);
     }
-    if (first.kind === "notFound") {
-      // 404 是确定结果：不重试、写 1 天负缓存；算一次正常完成并清零连续失败
-      this.recordSuccess(admission);
-      return this.outcome(null, true, false, false, false, "not_found");
-    }
-    if (first.kind === "skipped") {
-      return this.outcome(null, false, false, false, true);
-    }
-
-    // 第一次外部尝试失败：按「连续无任何成功」计数（半开探测失败会立即重开）
-    this.recordFailure(admission, this.clock.now());
-    if (this.breakerState !== "closed" || admission.probe) {
-      return this.outcome(null, false, true, false, false);
-    }
-    if (!isRetryableError(first.error)) {
-      return this.outcome(null, false, true, false, false);
-    }
-
-    // 退避时不占并发槽；退避期间若熔断已打开则不再补发，避免继续压外部接口
-    await this.clock.sleep(this.retryDelayMs());
-    if (this.breakerState !== "closed") {
-      return this.outcome(null, false, true, false, false);
-    }
-
-    const second = await this.attempt(id, false);
-    if (second.kind === "success") {
-      this.recordSuccess(admission);
-      const urls = pickCoverUrls(second.images);
-      return this.outcome(urls, true, false, true, false, urls ? "ok" : "no_image");
-    }
-    if (second.kind === "notFound") {
-      this.recordSuccess(admission);
-      return this.outcome(null, true, false, true, false, "not_found");
-    }
-    if (second.kind === "skipped") {
-      return this.outcome(null, false, true, false, false);
-    }
-
-    this.recordFailure(admission, this.clock.now());
-    return this.outcome(null, false, true, true, false);
   }
 
   private outcome(
     urls: CoverUrls | null,
     cacheable: boolean,
     failed: boolean,
-    retried: boolean,
     skipped: boolean,
     reason?: "ok" | "no_image" | "not_found",
   ): FetchOutcome {
-    return { urls, cacheable, failed, retried, skipped, reason };
-  }
-
-  /** 单次外部请求；被熔断拦下时返回 skipped（不发请求、不计失败）。 */
-  private async attempt(id: number, probe: boolean): Promise<AttemptResult> {
-    try {
-      const result = await this.gate.run(async () => {
-        // 普通请求排队期间熔断可能已打开：发车前再检查一次
-        if (!probe && this.breakerState !== "closed") return CIRCUIT_OPEN;
-        return await this.fetcher(id, this.createTimeoutSignal(this.timeoutMs));
-      });
-      if (result === CIRCUIT_OPEN) return { kind: "skipped" };
-      return { kind: "success", images: result };
-    } catch (error) {
-      if (error instanceof CoverNotFoundError) return { kind: "notFound" };
-      return { kind: "error", error };
-    }
-  }
-
-  /** 半开/打开准入：closed 放行；open 过期后只放行 1 个探测；其余拒绝。 */
-  private admit(now: number): Admission | null {
-    if (this.breakerState === "closed") return { probe: false };
-    if (this.breakerState === "open") {
-      if (now < this.circuitOpenUntil) return null;
-      this.breakerState = "half-open";
-      this.halfOpenProbeInFlight = false;
-    }
-    if (this.halfOpenProbeInFlight) return null;
-    this.halfOpenProbeInFlight = true;
-    return { probe: true };
-  }
-
-  /** 熔断打开且冷却未结束，或半开探测在飞：新批次只读缓存、不回源。 */
-  private isBreakerBlockingAll(now: number): boolean {
-    if (this.breakerState === "half-open") return true;
-    return this.breakerState === "open" && now < this.circuitOpenUntil;
-  }
-
-  /**
-   * 任何一次成功（有封面 / 无封面 / 404）都说明外部接口可用，清零连续失败。
-   * 半开探测成功则关闭熔断；普通请求的成功不会提前取消已经打开的冷却。
-   */
-  private recordSuccess(admission: Admission): void {
-    this.consecutiveFailures = 0;
-    if (admission.probe) {
-      this.breakerState = "closed";
-      this.circuitOpenUntil = 0;
-      this.halfOpenProbeInFlight = false;
-      this.warn("[cover] 熔断半开探测成功，恢复外部请求");
-    }
-  }
-
-  /**
-   * 只在「closed」状态累计连续失败，任何成功都会清零；因此单个 id 的偶发失败
-   * 不会单独触发熔断，只有连续 10 次完全没有成功才打开。半开探测失败则立即重开。
-   */
-  private recordFailure(admission: Admission, now: number): void {
-    if (this.breakerState !== "closed" && !admission.probe) return;
-    this.consecutiveFailures += 1;
-    if (admission.probe) {
-      this.openBreaker(now, "半开探测失败");
-      return;
-    }
-    if (
-      this.breakerState === "closed" &&
-      this.consecutiveFailures >= this.breakerThreshold
-    ) {
-      this.openBreaker(
-        now,
-        `连续 ${this.breakerThreshold} 次外部请求失败/超时`,
-      );
-    }
-  }
-
-  private openBreaker(now: number, reason: string): void {
-    this.breakerState = "open";
-    this.circuitOpenUntil = now + this.breakerCooldownMs;
-    this.halfOpenProbeInFlight = false;
-    this.consecutiveFailures = 0;
-    this.warn(
-      `[cover] ${reason}，暂停外部请求 ${Math.round(
-        this.breakerCooldownMs / 1000,
-      )}s，之后放行 1 个半开探测`,
-    );
+    return { urls, cacheable, failed, skipped, reason };
   }
 
   private getCache(): CoverCache | null {
@@ -613,43 +313,6 @@ class CoverServiceEngine implements CoverService {
   }
 }
 
-/**
- * 构造官方 API 请求头。`BGM_API_TOKEN` 存在时附加 Bearer token（仅发往
- * api.bgm.tv，不落日志、不写缓存）；未配置时保持匿名请求。
- */
-export function buildCoverRequestHeaders(
-  token: string | undefined = process.env.BGM_API_TOKEN,
-): Record<string, string> {
-  const headers: Record<string, string> = {
-    "User-Agent": COVER_USER_AGENT,
-    Accept: "application/json",
-  };
-  const trimmed = token?.trim();
-  if (trimmed) headers.Authorization = `Bearer ${trimmed}`;
-  return headers;
-}
-
-/** 默认 fetcher：带 UA / 可选 token、5s 超时，从 `/v0/subjects/{id}` 取 `images`。 */
-export async function fetchCoverFromBangumi(
-  id: number,
-  signal: AbortSignal,
-): Promise<unknown> {
-  const response = await fetch(`${COVER_API_BASE}/${id}`, {
-    headers: buildCoverRequestHeaders(),
-    signal,
-    cache: "no-store",
-  });
-
-  if (response.status === 404) throw new CoverNotFoundError(id);
-  if (!response.ok) throw new CoverHttpError(response.status, id);
-
-  const body: unknown = await response.json();
-  if (body !== null && typeof body === "object" && "images" in body) {
-    return (body as { images: unknown }).images;
-  }
-  return undefined;
-}
-
 function toRecord(
   ids: readonly number[],
   values: ReadonlyMap<number, CoverUrls | null>,
@@ -661,7 +324,7 @@ function toRecord(
   return record;
 }
 
-/** 创建独立实例（测试注入 fake fetcher / clock / 内存缓存）。 */
+/** 创建独立实例（测试注入 fake client / 假时钟 / 内存缓存）。 */
 export function createCoverService(
   options: CoverServiceOptions = {},
 ): CoverService {
@@ -677,12 +340,14 @@ function getDefaultService(): CoverService {
 
 /**
  * 生产入口。tRPC router 调用；永不抛错。
+ *
+ * `deps.client` 仅用于测试/脚本临时覆盖默认 `bgmClient`，生产路由无需传参。
  */
 export function getCovers(
   ids: number[],
-  client?: PrismaClient,
+  deps?: CoverServiceDeps,
 ): Promise<Record<string, CoverUrls | null>> {
-  return getDefaultService().getCovers(ids, client);
+  return getDefaultService().getCovers(ids, deps);
 }
 
 /** 关闭默认实例的 SQLite 句柄（测试清理 / 进程退出）。 */
