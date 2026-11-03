@@ -18,8 +18,8 @@ export interface SubjectCardProps {
   /** 封面 URL；`undefined` = 尚未加载，`null` = 无封面 / NSFW / 失败。 */
   cover?: CoverUrls | null;
   onTagClick: (tag: string) => void;
-  /** 鼠标进入本行：传入行的矩形，供 ResultList 定位悬浮预览。 */
-  onHover?: (rect: DOMRect) => void;
+  /** 鼠标进入本行：ResultList 据此延迟打开悬浮预览。 */
+  onHover?: () => void;
   /** 鼠标离开本行：ResultList 据此延迟关闭预览。 */
   onLeave?: () => void;
 }
@@ -45,7 +45,7 @@ export function SubjectCard({ subject, cover, onTagClick, onHover, onLeave }: Su
   return (
     <li
       className="group relative transition-colors hover:bg-slate-50"
-      onMouseEnter={(event) => onHover?.(event.currentTarget.getBoundingClientRect())}
+      onMouseEnter={() => onHover?.()}
       onMouseLeave={() => onLeave?.()}
     >
       <a

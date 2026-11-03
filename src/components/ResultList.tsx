@@ -15,8 +15,6 @@ export interface ResultListProps {
 
 interface HoveredRow {
   id: number;
-  /** 打开时刻的行矩形；页面滚动 / resize 会关闭面板，不追随。 */
-  rect: DOMRect;
 }
 
 /** 行 hover 后延迟打开：快速划过不逐个发请求。 */
@@ -74,12 +72,12 @@ export function ResultList({ items, covers, onTagClick }: ResultListProps) {
   }, []);
 
   const scheduleOpen = useCallback(
-    (id: number, rect: DOMRect) => {
+    (id: number) => {
       clearOpenTimer();
       clearCloseTimer();
       openTimerRef.current = window.setTimeout(() => {
         openTimerRef.current = null;
-        setHovered({ id, rect });
+        setHovered({ id });
       }, OPEN_DELAY_MS);
     },
     [clearCloseTimer, clearOpenTimer],
@@ -121,7 +119,7 @@ export function ResultList({ items, covers, onTagClick }: ResultListProps) {
     [clearCloseTimer, clearOpenTimer],
   );
 
-  // 页面滚动 / resize 会让行矩形失效：取消「还没打开」的计时；
+  // 页面滚动 / resize 时面板位置可能失效：取消「还没打开」的计时；
   // 已打开的面板由 HoverPreview 自己监听 scroll/resize 关闭（并忽略面板内部滚动）。
   useEffect(() => {
     const cancelPendingOpen = () => {
@@ -154,7 +152,7 @@ export function ResultList({ items, covers, onTagClick }: ResultListProps) {
             subject={subject}
             cover={covers[String(subject.id)] ?? null}
             onTagClick={onTagClick}
-            onHover={previewEnabled ? (rect) => scheduleOpen(subject.id, rect) : undefined}
+            onHover={previewEnabled ? () => scheduleOpen(subject.id) : undefined}
             onLeave={previewEnabled ? scheduleClose : undefined}
           />
         ))}
@@ -169,7 +167,6 @@ export function ResultList({ items, covers, onTagClick }: ResultListProps) {
             year: hoveredSubject.year,
             date: hoveredSubject.date,
           }}
-          anchorRect={hovered.rect}
           onKeepAlive={keepAlive}
           onRequestClose={scheduleClose}
         />

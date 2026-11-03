@@ -18,20 +18,30 @@ export interface HoverPreviewSubject {
 
 export interface HoverPreviewProps {
   subject: HoverPreviewSubject;
-  /** 行的 `getBoundingClientRect()`，用于把面板贴在行右缘。 */
-  anchorRect: DOMRect;
   /** 指针进入面板：取消 ResultList 里挂起的关闭计时。 */
   onKeepAlive: () => void;
   /** 指针离开面板 / 页面滚动 / 窗口 resize：请求关闭。 */
   onRequestClose: () => void;
 }
 
-/** 面板设计尺寸；实际会被视口夹紧（见 computePlacement）。 */
-const PANEL_MAX_WIDTH = 380;
-const PANEL_MAX_HEIGHT = 440;
-const VIEWPORT_MARGIN = 12;
-/** 面板右缘与行右缘的间距。 */
-const ANCHOR_GAP = 8;
+/** 面板最大宽度（内容列 1280 的一半）。 */
+const PANEL_MAX_WIDTH = 640;
+/** 面板最小宽度：窄屏仍按 48vw 缩小，但不低于 360。 */
+const PANEL_MIN_WIDTH = 360;
+/** 吸顶 Header 高度。 */
+const HEADER_HEIGHT = 56;
+/** 面板顶部：Header 下方 8px。 */
+const TOP_OFFSET = HEADER_HEIGHT + 8;
+/** 面板与视口右/下边缘的安全距离。 */
+const EDGE_MARGIN = 12;
+/** 高度 = 视口 - Header - 底部留白（24px）。 */
+const BOTTOM_GAP = 24;
+/** 与 `max-w-7xl` 一致的内容列最大宽度。 */
+const CONTENT_MAX_WIDTH = 1280;
+/** 内容列左右内边距（`px-4`）。 */
+const CONTENT_GUTTER = 16;
+/** 面板最小高度；极矮视口时以「不溢出」优先。 */
+const PANEL_MIN_HEIGHT = 420;
 
 interface PanelPlacement {
   top: number;
@@ -41,37 +51,45 @@ interface PanelPlacement {
 }
 
 /**
- * 以行为锚点计算 fixed 定位：
- * - `top = clamp(rect.top, 12, vh - panelH - 12)`；
- * - `right = max(12, vw - rect.right + 8)`，即面板右缘贴着行右缘（向内 8px）；
- * - 宽 `min(380, vw - 24)`，高 `min(440, 70vh)`。
+ * 大预览面板定位（不跟随行 top，避免大面板上下跳）：
+ * - 宽 `min(640px, 48vw)`，且不低于 360、不超出视口；
+ * - 高 `min(vh - 80, ...)`，即 Header 下几乎整列高度；
+ * - `top = 64`（Header 56 + 8）；
+ * - `right = max(12, (vw - contentWidth)/2 + 8)`，`contentWidth = min(vw - 32, 1280)`，
+ *   使面板右缘对齐内容列右缘（内缩 8px）。
  */
-function computePlacement(rect: DOMRect, viewportWidth: number, viewportHeight: number): PanelPlacement {
-  const width = Math.max(160, Math.min(PANEL_MAX_WIDTH, viewportWidth - VIEWPORT_MARGIN * 2));
-  const height = Math.max(160, Math.min(PANEL_MAX_HEIGHT, viewportHeight * 0.7));
-  const maxTop = Math.max(VIEWPORT_MARGIN, viewportHeight - height - VIEWPORT_MARGIN);
+function computePlacement(viewportWidth: number, viewportHeight: number): PanelPlacement {
+  const contentWidth = Math.min(viewportWidth - CONTENT_GUTTER * 2, CONTENT_MAX_WIDTH);
+  const width = Math.max(
+    PANEL_MIN_WIDTH,
+    Math.min(PANEL_MAX_WIDTH, viewportWidth * 0.48, viewportWidth - EDGE_MARGIN * 2),
+  );
+  const desiredHeight = viewportHeight - HEADER_HEIGHT - BOTTOM_GAP;
+  // 先保证「接近整列」，再夹到视口内（极矮视口时宁可不溢出也不强撑 420）。
+  const height = Math.min(
+    Math.max(desiredHeight, PANEL_MIN_HEIGHT),
+    viewportHeight - TOP_OFFSET - EDGE_MARGIN,
+  );
   return {
-    top: Math.min(Math.max(rect.top, VIEWPORT_MARGIN), maxTop),
-    right: Math.max(VIEWPORT_MARGIN, viewportWidth - rect.right + ANCHOR_GAP),
+    top: TOP_OFFSET,
+    right: Math.max(EDGE_MARGIN, (viewportWidth - contentWidth) / 2 + 8),
     width,
     height,
   };
 }
 
 /**
- * 悬浮预览：Portal 到 body 的 `position: fixed` 面板，避免被结果容器的
- * `overflow-hidden` 裁剪，也保证位于整卡 `<a>` 覆盖层之上（z-50）。
+ * 悬浮预览：Portal 到 body 的 `position: fixed` 面板，固定在内容列右侧、约半列宽、
+ * 接近整列高；避免被结果容器的 `overflow-hidden` 裁剪，也位于整卡 `<a>` 之上（z-50）。
  *
  * 结构（参考 ui-design.md §2.12）：标题 + 类型/年份 → 可滚动简介（不截断）→
- * 分隔线 → 标签（名称 + 计数，可滚动）+ 公共标签。
+ * 分隔线 → 底部标签（名称 + 计数，可滚动）+ 公共标签。
+ *
+ * 滚轮：面板内用 native `wheel`（passive:false）拦截，只滚 `[data-preview-scroll]`
+ * 容器；容器已到边界或没有容器时滚轮被吞掉，页面/列表绝不滚动。
  * 面板自身阻止 click / mousedown 冒泡，因此点面板不会跳转 bgm.tv。
  */
-export function HoverPreview({
-  subject,
-  anchorRect,
-  onKeepAlive,
-  onRequestClose,
-}: HoverPreviewProps) {
+export function HoverPreview({ subject, onKeepAlive, onRequestClose }: HoverPreviewProps) {
   const panelRef = useRef<HTMLDivElement>(null);
 
   // 组件只在 hover 打开后挂载，等价于 `enabled: open`；缓存 5 分钟避免快速划过时重复请求。
@@ -88,14 +106,13 @@ export function HoverPreview({
   const placement = useMemo(
     () =>
       computePlacement(
-        anchorRect,
         typeof window === "undefined" ? 0 : window.innerWidth,
         typeof window === "undefined" ? 0 : window.innerHeight,
       ),
-    [anchorRect],
+    [],
   );
 
-  // 页面滚动 / 窗口 resize 时面板锚点失效，直接关闭；面板内部的简介/标签滚动不算。
+  // 页面滚动 / 窗口 resize 时面板位置失效，直接关闭；面板内部的简介/标签滚动不算。
   useEffect(() => {
     const handleScroll = (event: Event) => {
       const panel = panelRef.current;
@@ -110,6 +127,25 @@ export function HoverPreview({
       window.removeEventListener("resize", handleResize);
     };
   }, [onRequestClose]);
+
+  // React 的 onWheel 在根节点是 passive，preventDefault 无效；必须用 native listener。
+  // 指针在面板内时永远 preventDefault（吞掉滚动），仅手动滚动面板内部容器。
+  useEffect(() => {
+    const panel = panelRef.current;
+    if (!panel) return;
+
+    const handleWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      const target = event.target instanceof Element ? event.target.closest("[data-preview-scroll]") : null;
+      if (!(target instanceof HTMLElement)) return;
+      const scale =
+        event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? target.clientHeight : 1;
+      target.scrollTop += event.deltaY * scale;
+    };
+
+    panel.addEventListener("wheel", handleWheel, { passive: false });
+    return () => panel.removeEventListener("wheel", handleWheel);
+  }, []);
 
   if (typeof document === "undefined") return null;
 
@@ -136,8 +172,8 @@ export function HoverPreview({
       }}
       onMouseDown={(event) => event.stopPropagation()}
     >
-      <div className="shrink-0 border-b border-slate-100 px-3 py-2">
-        <h3 className="truncate text-sm font-medium text-slate-900" title={subject.name}>
+      <div className="shrink-0 border-b border-slate-100 px-4 py-3">
+        <h3 className="truncate text-base font-medium text-slate-900" title={subject.name}>
           {subject.name}
         </h3>
         <p className="mt-0.5 text-xs text-slate-500">
@@ -149,7 +185,8 @@ export function HoverPreview({
 
       <div
         data-preview-summary=""
-        className="min-h-0 flex-1 overflow-y-auto whitespace-pre-wrap px-3 py-2 text-[13px] leading-relaxed text-slate-600"
+        data-preview-scroll=""
+        className="min-h-0 flex-1 overflow-y-auto whitespace-pre-wrap px-4 py-3 text-[13px] leading-relaxed text-slate-600"
       >
         {previewQuery.isError ? (
           <p className="text-slate-500">预览加载失败</p>
@@ -162,14 +199,18 @@ export function HoverPreview({
         )}
       </div>
 
-      <div className="shrink-0 border-t border-slate-100 px-3 py-2">
+      <div className="shrink-0 border-t border-slate-100 px-4 py-3">
         <p className="mb-1.5 text-xs font-medium text-slate-700">
           标签 <span className="tabular-nums text-slate-500">{tags.length}</span>
         </p>
         {tags.length === 0 ? (
           <p className="text-xs text-slate-400">暂无标签</p>
         ) : (
-          <div data-preview-tags="" className="flex max-h-[132px] flex-wrap gap-1 overflow-y-auto">
+          <div
+            data-preview-tags=""
+            data-preview-scroll=""
+            className="flex max-h-[200px] flex-wrap gap-1 overflow-y-auto"
+          >
             {tags.map((tag) => (
               <span
                 key={tag.name}
@@ -185,9 +226,13 @@ export function HoverPreview({
         )}
 
         {metaTags.length > 0 && (
-          <div className="mt-2">
+          <div className="mt-3">
             <p className="mb-1 text-[11px] text-slate-400">公共标签</p>
-            <div className="flex max-h-[46px] flex-wrap gap-1 overflow-y-auto">
+            <div
+              data-preview-meta=""
+              data-preview-scroll=""
+              className="flex max-h-[72px] flex-wrap gap-1 overflow-y-auto"
+            >
               {metaTags.map((tag) => (
                 <span
                   key={tag}
