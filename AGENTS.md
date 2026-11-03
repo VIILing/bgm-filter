@@ -21,8 +21,8 @@
 
 | 项 | 要求 | 本项目实测 |
 | --- | --- | --- |
-| Node | ≥ 20（推荐 22 LTS） | v27.0.0-alpha（可运行，但新环境建议用 22 LTS） |
-| pnpm | ≥ 9 | 12.16.1 |
+| Node | **≥ 22.5**（推荐 22.13+ / 24 LTS） | v27.0.0-alpha（可运行） |
+| pnpm | **12.x**（`allowBuilds` 语义） | 12.16.1 |
 | 磁盘 | ≥ 4 GB 空闲（dump 1.9 GB + DB 740 MB + node_modules ~700 MB） | 41 GB 可用 |
 | 网络 | 安装依赖、首次下载 dump、取封面时需要 | 已通 |
 
@@ -44,7 +44,7 @@ curl -L -o dump.zip "https://github.com/bangumi/Archive/releases/download/archiv
 unzip -o dump.zip && cd ..
 # 至少需要 dump-db/subject.jsonlines（993 MB，700,108 行）
 
-# 3) 导入（约 30 s，生成 prisma/dev.db）
+# 3) 导入（约 27–31 s，生成 prisma/dev.db）
 pnpm db:import
 
 # 4) 启动
@@ -62,6 +62,9 @@ pnpm exec next dev -H 0.0.0.0 -p 7737
 | `DUMP_DIR` | 环境变量（可选） | 覆盖 dump 目录，默认 `dump-db` |
 
 模板见 `.env.template`。改完 `.env.local` **必须重启 dev** 才生效。
+
+> **Node 必须 ≥ 22.5**：`scripts/import-dump.mjs`、`scripts/verify-db.mjs` 与测试都依赖内置 `node:sqlite`，Node 20 会直接 `ERR_UNKNOWN_BUILTIN_MODULE`。
+> **`pnpm db:import` 会重写 `docs/data-report.md`**（写入当次时间戳与本机绝对路径），这是预期产物变更，`git status` 出现它被修改不代表工作区被弄坏。
 
 ---
 
@@ -125,7 +128,7 @@ SubjectTag(subjectId, tagId)   // 复合主键 + @@index([tagId, subjectId])
 | Subject / Tag / SubjectTag | 700,108 / 91,909 / 2,267,357 |
 | summary 非空 | 575,804 |
 | 有评分 / 无日期 | 287,448 / 53,871 |
-| 导入耗时 / DB 体积 | 约 31 s / 740 MB |
+| 导入耗时 / DB 体积 | 约 27–31 s / 740 MB |
 
 > `docs/requirements.md` 早期预估「约 500 万标签关联」有误，实测 2,267,357；详见 `docs/data-report.md`。
 
@@ -173,7 +176,7 @@ C = Σ(score*votes)/Σ(votes)（动态查询，约 7.104），m = 50
 | `pnpm typecheck` | `tsc --noEmit` |
 | `pnpm test` | Vitest（单元 + 真实数据集成，共 171 项） |
 | `pnpm db:generate` / `db:push` | Prisma Client / 建表 |
-| `pnpm db:import` | JSONL → SQLite（幂等，约 31 s） |
+| `pnpm db:import` | JSONL → SQLite（幂等，约 27–31 s；会重写 `docs/data-report.md`） |
 | `node --env-file=.env scripts/verify-db.mjs` | 计数/完整性/性能校验 |
 | `pnpm exec vitest run src/server/cover` | 只跑某个模块 |
 

@@ -2,6 +2,7 @@
   "name": "bgm-filter",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "pnpm@12.16.1",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -44,5 +45,8 @@
       "sharp",
       "unrs-resolver"
     ]
+  },
+  "engines": {
+    "node": ">=22.5.0"
   }
 }

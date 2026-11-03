@@ -22,6 +22,8 @@
 
 T3 Stack：**Next.js 15**（App Router）+ **React 19** + **TypeScript** + **tRPC 11** + **Prisma 6**（SQLite）+ **Tailwind CSS 4**；测试 **Vitest 3**；包管理 **pnpm**。
 
+> 环境要求：**Node ≥ 22.5**（推荐 22.13+ / 24 LTS；`node:sqlite` 内置模块依赖）与 **pnpm 12.x**（`pnpm-workspace.yaml` 的 `allowBuilds` 依赖其新语义）。仓库内 `.nvmrc` 与 `packageManager` 已注明。
+
 ## 快速开始
 
 ```bash
@@ -35,7 +37,7 @@ pnpm db:push
 # 3. 准备数据（首次）
 #    下载并解压到 dump-db/，确保 dump-db/subject.jsonlines 存在
 #    https://github.com/bangumi/Archive/releases/tag/archive
-pnpm db:import          # 约 20 秒，生成 prisma/dev.db（311.8 MB）
+pnpm db:import          # 约 27 秒，生成 prisma/dev.db（740 MB，含简介原文约 363 MB）
 
 # 4. 启动
 pnpm dev                # http://localhost:3000
@@ -82,7 +84,7 @@ primary := "(" expr ")" | tag
 | 标签关联 | 2,267,357（Σ 每条目 `tags ∪ meta_tags` 去重） |
 | 有评分 / 无日期 | 287,448 / 53,871 |
 | 有简介 | 575,804（平均 661 B，最长 15,130 字符） |
-| 导入耗时 / DB 体积 | 31.6 s / 740 MB（含简介原文约 363 MB） |
+| 导入耗时 / DB 体积 | 27.3 s / 740 MB（含简介原文约 363 MB） |
 
 > 注：`docs/requirements.md` 早期版本预估「约 500 万标签关联」有误；dump 中 `tags` 数组实际均值约 2.8 个，实测与独立扫描一致为 2,267,357，详见 `docs/data-report.md`。
 
