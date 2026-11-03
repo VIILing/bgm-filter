@@ -96,7 +96,8 @@ Bangumi 全量条目数据（约 70 万条）以 JSONL 形式存放在本地 `du
 - `rank`（>0 时显示「#1933」样式）；
 - 标签：最多 8 个（用户标签优先，其次公共标签），点击标签把该标签**追加**到当前标签表达式（自动处理 `&`、引号、去重）；
 - 「看过」人数（`favorite.done`，来自 dump 的 favorite 字段）；
-- 整卡链接到 `https://bgm.tv/subject/{id}`，新窗口打开（`rel="noreferrer"`）。
+- 整卡链接到 `https://bgm.tv/subject/{id}`，新窗口打开（`rel="noreferrer"`）；
+- **悬浮预览**：鼠标停留 150ms 后在行右侧弹出面板，上方为完整简介（不折叠、面板内独立滚动），下方为标签及计数（来自 `tagsJson`）；点击面板不跳转，点击行内其它区域才打开 bgm.tv；触屏/窄屏不启用（详见 `docs/ui-design.md` §2.12）。
 
 ### F9 状态与空态
 

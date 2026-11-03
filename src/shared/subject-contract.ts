@@ -60,6 +60,20 @@ export interface StatsDto {
 
 export const PAGE_SIZE = 50;
 
+/** 悬浮预览里的一个带计数标签（来自 `tagsJson`，按 count 降序）。 */
+export interface SubjectPreviewTag {
+  name: string;
+  count: number;
+}
+
+/** 悬浮预览数据：简介 + 用户标签（带计数）+ 公共标签（无计数）。 */
+export interface SubjectPreviewDto {
+  id: number;
+  summary: string | null;
+  tags: SubjectPreviewTag[];
+  metaTags: string[];
+}
+
 /**
  * 卡片封面 URL。三个尺寸都由官方 API 的 `images` 原样取用：
  * grid = /r/100、small = /r/200、common = /r/400；浏览器直连 lain.bgm.tv。

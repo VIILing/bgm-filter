@@ -18,6 +18,10 @@ export interface SubjectCardProps {
   /** 封面 URL；`undefined` = 尚未加载，`null` = 无封面 / NSFW / 失败。 */
   cover?: CoverUrls | null;
   onTagClick: (tag: string) => void;
+  /** 鼠标进入本行：传入行的矩形，供 ResultList 定位悬浮预览。 */
+  onHover?: (rect: DOMRect) => void;
+  /** 鼠标离开本行：ResultList 据此延迟关闭预览。 */
+  onLeave?: () => void;
 }
 
 /**
@@ -27,7 +31,7 @@ export interface SubjectCardProps {
  * 封面只负责展示，不阻塞文字渲染：`cover` 未到达时先显示占位块，到达后替换。
  * 加载失败记录失败的 URL 并切回占位，同一 URL 不会反复重试。
  */
-export function SubjectCard({ subject, cover, onTagClick }: SubjectCardProps) {
+export function SubjectCard({ subject, cover, onTagClick, onHover, onLeave }: SubjectCardProps) {
   const [failedCoverUrl, setFailedCoverUrl] = useState<string | null>(null);
   const hasScore = subject.score > 0;
   const subtitle = subject.nameCn && subject.nameCn !== subject.name ? subject.nameCn : null;
@@ -39,7 +43,11 @@ export function SubjectCard({ subject, cover, onTagClick }: SubjectCardProps) {
   const showCover = coverUrl !== null && coverUrl !== failedCoverUrl;
 
   return (
-    <li className="group relative transition-colors hover:bg-slate-50">
+    <li
+      className="group relative transition-colors hover:bg-slate-50"
+      onMouseEnter={(event) => onHover?.(event.currentTarget.getBoundingClientRect())}
+      onMouseLeave={() => onLeave?.()}
+    >
       <a
         href={`https://bgm.tv/subject/${subject.id}`}
         target="_blank"

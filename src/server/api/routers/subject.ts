@@ -6,8 +6,10 @@ import {
   searchInputSchema,
   type SearchResultDto,
   type StatsDto,
+  type SubjectPreviewDto,
   type TagSuggestionDto,
 } from "~/shared/subject-contract";
+import { parsePreviewMetaTags, parsePreviewTags } from "~/server/api/routers/preview-utils";
 import { createTRPCRouter, publicProcedure } from "~/server/api/trpc";
 import { getCovers } from "~/server/cover/cover-service";
 import {
@@ -47,6 +49,29 @@ export const subjectRouter = createTRPCRouter({
   stats: publicProcedure.query(({ ctx }): Promise<StatsDto> =>
     getSubjectStats(ctx.db),
   ),
+
+  /**
+   * 悬浮预览：简介 + 用户标签（带计数，来自 tagsJson）+ 公共标签（metaTagsJson）。
+   * 仅在鼠标悬浮行时按需请求；找不到条目返回 null。
+   * tagsJson 解析失败按空数组处理（`parsePreviewTags`），不抛错影响列表。
+   */
+  preview: publicProcedure
+    .input(z.object({ id: z.number().int().positive() }))
+    .query(async ({ input, ctx }): Promise<SubjectPreviewDto | null> => {
+      const row = await ctx.db.subject.findUnique({
+        where: { id: input.id },
+        select: { summary: true, tagsJson: true, metaTagsJson: true },
+      });
+      if (!row) return null;
+
+      const summary = row.summary?.trim() ?? "";
+      return {
+        id: input.id,
+        summary: summary.length > 0 ? summary : null,
+        tags: parsePreviewTags(row.tagsJson),
+        metaTags: parsePreviewMetaTags(row.metaTagsJson),
+      };
+    }),
 
   /**
    * 批量取封面 URL（最多 50 个 id，可重复/含非法值，服务端会清洗）。

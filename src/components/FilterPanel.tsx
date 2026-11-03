@@ -37,7 +37,7 @@ export interface FilterPanelProps {
 const nameInputClass =
   "w-full rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-200";
 
-/** 白色筛选卡片：sticky（桌面） + 重置。 */
+/** 白色筛选卡片：随页面滚动（不吸顶，避免长期占用视口顶部空间） + 重置。 */
 export function FilterPanel({
   tagExpr,
   tagParse,
@@ -62,7 +62,7 @@ export function FilterPanel({
   onReset,
 }: FilterPanelProps) {
   return (
-    <div className="relative z-20 -mx-4 bg-slate-50/95 px-4 pb-2 pt-4 backdrop-blur md:sticky md:top-14">
+    <div className="pb-2 pt-4">
       <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm" aria-label="筛选条件">
         <div className="mb-3 flex items-center justify-between gap-3">
           <h2 className="text-sm font-semibold text-slate-800">筛选</h2>

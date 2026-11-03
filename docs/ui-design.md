@@ -10,7 +10,7 @@
 │ Header（深色 slate-900 背景，sticky top-0 z-30）                          │
 │  BGM Filter        共 700,108 条 · 有标签 422,912 条      [数据：2026-10-27]│
 ├──────────────────────────────────────────────────────────────────────────┤
-│ FilterPanel（白色卡片，max-w-7xl，sticky top-14，z-20，shadow-sm）        │
+│ FilterPanel（白色卡片，max-w-7xl，**随页面滚动，不吸顶**，shadow-sm）    │
 │  标签表达式                                                              │
 │  ┌────────────────────────────────────────────────────────────┐ [搜索]   │
 │  │ 科幻 & (恋爱 | 百合) & !R18                                │          │
@@ -99,9 +99,29 @@
 - 当前页 `aria-current="page"`；禁用态 `opacity-40 cursor-not-allowed`。
 - 页码点击 → 只改 `page`，滚动到结果区顶部（`scrollIntoView({behavior:"smooth"})`）。
 
+### 2.12 `HoverPreview`（悬浮预览：简介 + 标签计数）
+
+> 用户需求：条目右侧区域很空，鼠标悬浮某一行时在右侧弹出预览；上方简介（不折叠、可滚动）、下方标签及计数；点击非预览区域才跳 bgm.tv。
+
+- **触发**：`mouseenter` 行 150ms 后显示；`mouseleave` 行 120ms 后隐藏，若指针进入预览面板则取消隐藏（面板上 `mouseenter` 保持、`mouseleave` 再计时关闭）。
+- **数据**：`trpc.subject.preview.useQuery({ id })`，仅 hover 时请求（`enabled`），`staleTime: 5min`；返回 `{ summary: string | null; tags: { name: string; count: number }[] }`；标签来自 `tagsJson`（按 count 降序），无标签显示「暂无标签」，简介为空显示「暂无简介」。
+- **定位**：用 `position: fixed` + **Portal 到 `document.body`**（避免被结果容器 `overflow-hidden` 裁剪）。以行 `getBoundingClientRect()` 为锚点：`top = clamp(rect.top, 12, vh - panelH - 12)`；`right = max(12, vw - rect.right + 8)`，即贴着行右缘。窗口 resize / 页面滚动时关闭面板。
+- **尺寸**：宽 `min(380px, vw - 24px)`，高 `min(440px, 70vh)`；白底、`rounded-lg`、`shadow-xl`、`border border-slate-200`、`z-50`。
+- **内容结构**（上下两段，简介在上）：
+  1. 顶部一行：`name`（截断）+ 类型/年份小字；
+  2. **简介**：`flex-1 overflow-y-auto whitespace-pre-wrap pr-1 text-[13px] leading-relaxed text-slate-600`，**不折叠、不 line-clamp**，鼠标在面板内滚动即滚动简介；
+  3. 分隔线；
+  4. **标签**：标题「标签 N」+ 换行 chips，形如 `井上雄彦 575`（名称 + count，`tabular-nums`），最多 `max-h-[132px] overflow-y-auto`。
+- **点击行为**：面板整体 `onClick={e => e.stopPropagation()}`，且位于 `<a>` 覆盖层之上（z-50），因此点面板不跳转；点击行内其它区域走原有整卡链接。标签 chip 在预览中仅展示、不可点击（避免误触筛选）。
+- **性能**：同一时刻只允许一个预览；切换行时复用查询缓存；鼠标快速划过不逐个请求（150ms 防抖）。
+- **可访问性**：`role="tooltip"`、`aria-label="条目预览"`；键盘聚焦行时不弹（V1 仅鼠标/触屏长按不做）。
+- **触屏/窄屏**：`@media (hover: none)` 不启用；`<768px` 不展示，避免遮挡。
+- **降级**：请求失败时面板显示「预览加载失败」，不影响行本身。
+
 ## 3. 响应式
 - `max-w-7xl mx-auto px-4`；筛选控件用 `grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4`。
-- <768px：筛选面板取消 sticky（避免占满屏），Header 统计省略「有标签」部分。
+- 筛选面板**任何宽度都不吸顶**（用户要求：固定太占视觉空间，随页面滚动下去）；仅 Header 吸顶。
+- <768px：Header 统计省略「有标签」部分；悬浮预览不启用（触屏无 hover）。
 
 ## 4. 状态与数据流
 

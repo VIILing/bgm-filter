@@ -320,7 +320,8 @@ export function HomeClient() {
           onReset={resetFilters}
         />
 
-        <section ref={resultTopRef} className="scroll-mt-32 pt-1" aria-busy={searchQuery.isFetching}>
+        {/* 筛选区不吸顶，分页后只需把结果区滚到吸顶 Header 下方（h-14 = 56px，留 8px 余量）。 */}
+        <section ref={resultTopRef} className="scroll-mt-16 pt-1" aria-busy={searchQuery.isFetching}>
           {isRefreshing && (
             <div
               className="h-0.5 w-full animate-pulse bg-sky-500"
