@@ -4,6 +4,7 @@ import { keepPreviousData } from "@tanstack/react-query";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { CoverLoader, type CoverMap } from "~/components/CoverLoader";
 import { EmptyState } from "~/components/EmptyState";
 import { ErrorState } from "~/components/ErrorState";
 import { FilterPanel } from "~/components/FilterPanel";
@@ -12,6 +13,7 @@ import { Pagination } from "~/components/Pagination";
 import { ResultList } from "~/components/ResultList";
 import { ResultSummary } from "~/components/ResultSummary";
 import { SkeletonRows } from "~/components/SkeletonRows";
+import { chunkCoverIds } from "~/lib/cover-batch";
 import { insertTag } from "~/lib/tag-insert";
 import { parseTagExpr } from "~/lib/tag-parse-lite";
 import {
@@ -45,6 +47,16 @@ interface ParsedYearInput {
   value: number | null;
   invalid: boolean;
 }
+
+interface CoverLoadState {
+  /** 结果集标识：切换筛选/翻页后旧封面立即作废。 */
+  batchKey: string;
+  covers: CoverMap;
+  /** 已完成的块序号；用 Set 防止同一块重复回调导致计数失真。 */
+  loadedChunks: Set<number>;
+}
+
+const EMPTY_COVER_MAP: CoverMap = {};
 
 function parseYearInput(text: string): ParsedYearInput {
   const trimmed = text.trim();
@@ -218,6 +230,44 @@ export function HomeClient() {
   const result = searchQuery.data;
   const items = result?.items ?? [];
   const totalPages = Math.max(1, result?.totalPages ?? 1);
+
+  // 封面：每 10 个 id 一块，最多 5 块（与 PAGE_SIZE / COVER_IDS_MAX 一致）。
+  // 块查询由子组件 CoverLoader 承载，避免在循环里调用 hooks。
+  const coverChunks = useMemo(() => chunkCoverIds(items.map((item) => item.id)), [items]);
+  const coverBatchKey = useMemo(
+    () => coverChunks.map((chunk) => chunk.join(",")).join("|"),
+    [coverChunks],
+  );
+
+  const [coverState, setCoverState] = useState<CoverLoadState>({
+    batchKey: "",
+    covers: EMPTY_COVER_MAP,
+    loadedChunks: new Set<number>(),
+  });
+
+  const loadedChunkCount =
+    coverState.batchKey === coverBatchKey ? coverState.loadedChunks.size : 0;
+  // 结果集变化后、新一批封面到达前不展示旧页封面，直接回退占位块。
+  const covers = coverState.batchKey === coverBatchKey ? coverState.covers : EMPTY_COVER_MAP;
+
+  const handleCoverLoaded = useCallback(
+    (batchKey: string, chunkIndex: number, chunkCovers: CoverMap) => {
+      setCoverState((previous) => {
+        const base =
+          previous.batchKey === batchKey
+            ? previous
+            : { batchKey, covers: EMPTY_COVER_MAP, loadedChunks: new Set<number>() };
+        const loadedChunks = new Set(base.loadedChunks);
+        loadedChunks.add(chunkIndex);
+        return {
+          batchKey,
+          covers: { ...base.covers, ...chunkCovers },
+          loadedChunks,
+        };
+      });
+    },
+    [],
+  );
   const displayPage = searchQuery.isPlaceholderData ? state.page : (result?.page ?? state.page);
   const isInitialLoading = canSearch && searchQuery.isPending && result === undefined;
   const isRefreshing = searchQuery.isFetching && !isInitialLoading;
@@ -329,7 +379,19 @@ export function HomeClient() {
               </div>
             ) : result !== undefined ? (
               <div className="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
-                <ResultList items={items} onTagClick={appendTag} />
+                {/* 每块 10 个 id；前一块完成后再启用下一块，保证封面约每 5s 渐进出 10 张，
+                    也避免多块并发被 tRPC 批处理 / 服务端全局限速交错成一个慢响应。 */}
+                {coverChunks.map((chunk, index) => (
+                  <CoverLoader
+                    key={`${coverBatchKey}:${index}`}
+                    ids={chunk}
+                    batchKey={coverBatchKey}
+                    index={index}
+                    enabled={index === 0 || loadedChunkCount >= index}
+                    onLoaded={handleCoverLoaded}
+                  />
+                ))}
+                <ResultList items={items} covers={covers} onTagClick={appendTag} />
               </div>
             ) : null}
           </div>

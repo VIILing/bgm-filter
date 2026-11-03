@@ -1,5 +1,9 @@
+"use client";
+
+import { useState } from "react";
+
 import { formatCount, formatYear } from "~/lib/format";
-import { TYPE_LABEL, type SubjectCardDto } from "~/shared/subject-contract";
+import { TYPE_LABEL, type CoverUrls, type SubjectCardDto } from "~/shared/subject-contract";
 
 const TYPE_BADGE: Record<number, string> = {
   1: "bg-emerald-100 text-emerald-800",
@@ -11,16 +15,28 @@ const TYPE_BADGE: Record<number, string> = {
 
 export interface SubjectCardProps {
   subject: SubjectCardDto;
+  /** 封面 URL；`undefined` = 尚未加载，`null` = 无封面 / NSFW / 失败。 */
+  cover?: CoverUrls | null;
   onTagClick: (tag: string) => void;
 }
 
-/** 行式结果卡片：评分块 + 标题/中文名 + 类型徽标 + 日期 + rank/看过 + ≤8 标签。 */
-export function SubjectCard({ subject, onTagClick }: SubjectCardProps) {
+/**
+ * 行式结果卡片：左侧 2:3 封面（无图时灰底占位，保持比例避免 CLS），
+ * 右侧标题/中文名 + 类型徽标 + 日期 + 评分/rank/看过 meta 行 + ≤8 标签。
+ *
+ * 封面只负责展示，不阻塞文字渲染：`cover` 未到达时先显示占位块，到达后替换。
+ * 加载失败记录失败的 URL 并切回占位，同一 URL 不会反复重试。
+ */
+export function SubjectCard({ subject, cover, onTagClick }: SubjectCardProps) {
+  const [failedCoverUrl, setFailedCoverUrl] = useState<string | null>(null);
   const hasScore = subject.score > 0;
   const subtitle = subject.nameCn && subject.nameCn !== subject.name ? subject.nameCn : null;
   const dateText = formatYear(subject.year, subject.date);
   const tags = subject.tags.slice(0, 8);
   const fullTitle = subtitle ? `${subject.name} / ${subtitle}` : subject.name;
+
+  const coverUrl = cover?.small && cover.small.length > 0 ? cover.small : null;
+  const showCover = coverUrl !== null && coverUrl !== failedCoverUrl;
 
   return (
     <li className="group relative transition-colors hover:bg-slate-50">
@@ -33,26 +49,37 @@ export function SubjectCard({ subject, onTagClick }: SubjectCardProps) {
         className="absolute inset-0 z-0 rounded-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-sky-500"
       />
 
-      <div className="pointer-events-none relative z-10 flex flex-col gap-2 px-3 py-3 sm:flex-row sm:gap-4 sm:px-4">
-        <div className="flex w-full shrink-0 flex-row items-center justify-between gap-2 sm:w-[72px] sm:flex-col sm:justify-center sm:border-r sm:border-slate-100 sm:pr-3">
-          <div className="flex items-baseline gap-1.5 sm:flex-col sm:items-center sm:gap-0">
-            <span
-              className={`text-2xl font-bold tabular-nums ${hasScore ? "text-slate-900" : "text-slate-400"}`}
-              title={hasScore ? `评分 ${subject.score.toFixed(1)}` : "无评分"}
-            >
-              {hasScore ? subject.score.toFixed(1) : "—"}
-            </span>
-            <span className="text-[11px] text-slate-500">
-              {hasScore ? `${formatCount(subject.scoreVotes)} 人评分` : "无评分"}
-            </span>
-          </div>
+      <div className="pointer-events-none relative z-10 flex items-start gap-3 px-3 py-3 sm:gap-4 sm:px-4">
+        <div className="aspect-[2/3] w-[56px] shrink-0 overflow-hidden rounded bg-slate-100 sm:w-[76px]">
+          {showCover ? (
+            <img
+              src={coverUrl}
+              alt={`${subject.name} 封面`}
+              loading="lazy"
+              decoding="async"
+              referrerPolicy="no-referrer"
+              className="h-full w-full object-cover"
+              onError={() => setFailedCoverUrl(coverUrl)}
+            />
+          ) : (
+            <div className="flex h-full w-full items-center justify-center text-[10px] text-slate-400">
+              无封面
+            </div>
+          )}
         </div>
 
         <div className="min-w-0 flex-1">
           <div className="flex items-start justify-between gap-2">
-            <h3 className="min-w-0 truncate text-base font-medium text-slate-900" title={subject.name}>
-              {subject.name}
-            </h3>
+            <div className="min-w-0">
+              <h3 className="truncate text-base font-medium text-slate-900" title={subject.name}>
+                {subject.name}
+              </h3>
+              {subtitle && (
+                <p className="truncate text-xs text-slate-500" title={subtitle}>
+                  {subtitle}
+                </p>
+              )}
+            </div>
             <div className="flex shrink-0 items-center gap-2">
               <span
                 className={`rounded px-1.5 py-0.5 text-[11px] font-medium ${
@@ -67,10 +94,19 @@ export function SubjectCard({ subject, onTagClick }: SubjectCardProps) {
             </div>
           </div>
 
-          <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-slate-500">
-            {subtitle && (
-              <span className="min-w-0 truncate" title={subtitle}>
-                {subtitle}
+          <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-slate-500">
+            {hasScore ? (
+              <span
+                className="whitespace-nowrap tabular-nums"
+                title={`评分 ${subject.score.toFixed(1)} · ${subject.scoreVotes} 人评分`}
+              >
+                <span className="font-medium tabular-nums text-slate-700">{subject.score.toFixed(1)}</span>
+                {" · "}
+                <span>{formatCount(subject.scoreVotes)} 人评分</span>
+              </span>
+            ) : (
+              <span className="whitespace-nowrap tabular-nums text-slate-400" title="暂无评分">
+                — 无评分
               </span>
             )}
             {subject.rank !== null && subject.rank > 0 && (

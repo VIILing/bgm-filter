@@ -1,12 +1,15 @@
 import { z } from "zod";
 
 import {
+  COVER_IDS_MAX,
+  type CoverUrls,
   searchInputSchema,
   type SearchResultDto,
   type StatsDto,
   type TagSuggestionDto,
 } from "~/shared/subject-contract";
 import { createTRPCRouter, publicProcedure } from "~/server/api/trpc";
+import { getCovers } from "~/server/cover/cover-service";
 import {
   getSubjectStats,
   searchSubjects,
@@ -44,4 +47,19 @@ export const subjectRouter = createTRPCRouter({
   stats: publicProcedure.query(({ ctx }): Promise<StatsDto> =>
     getSubjectStats(ctx.db),
   ),
+
+  /**
+   * 批量取封面 URL（最多 50 个 id，可重复/含非法值，服务端会清洗）。
+   * 只返回 URL，图片由浏览器直连 lain.bgm.tv；无封面/失败/NSFW 均为 null。
+   */
+  covers: publicProcedure
+    .input(
+      z.object({
+        ids: z.array(z.number().int().positive()).max(COVER_IDS_MAX),
+      }),
+    )
+    .query(
+      ({ input, ctx }): Promise<Record<string, CoverUrls | null>> =>
+        getCovers(input.ids, ctx.db),
+    ),
 });

@@ -76,10 +76,10 @@
 - 有标签条件时显示「清空标签」按钮。
 
 ### 2.7 `SubjectCard`（行式卡片）
-- 左侧评分块（宽 72px）：分数 `8.7`（`text-2xl font-bold`，无评分显示 `—` + 小字「无评分」），下方 `1.2万 人评分`（`scoreVotes` 用 `formatCount`）。
+- 左侧封面块：`aspect-[2/3]`，桌面宽 76px、移动宽 56px，`overflow-hidden rounded bg-slate-100`；`<img src={cover.small}>`（`lain.bgm.tv/r/200`）带 `loading="lazy"` `decoding="async"` `referrerPolicy="no-referrer"`；无封面 / `nsfw` / 加载失败 → 居中「无封面」灰块（保持 2:3，不产生 CLS）。
 - 主区：
   - 第一行：`name`（`text-base font-medium truncate`，`title` 全文），右侧类型徽标（漫画=emerald、动画=sky、音乐=violet、游戏=amber、三次元=rose，浅底深字）+ 日期/年份。
-  - 第二行：`nameCn`（若存在且 ≠ name，`text-sm text-slate-500 truncate`）+ `#rank` + `看过 {n}`。
+  - 第二行：`nameCn`（若存在且 ≠ name，`text-sm text-slate-500 truncate`）+ 评分 `8.7 · 1.2万 人评分`（`font-medium tabular-nums`；无评分显示 `— 无评分`）+ `#rank` + `看过 {n}`。
   - 第三行：标签 chips（最多 8，`text-xs`，`bg-slate-100`，hover 变 `bg-slate-200`），点击追加表达式。
 - 整卡 `<a href="https://bgm.tv/subject/{id}" target="_blank" rel="noreferrer">`；标签 chip 点击 `preventDefault` + `stopPropagation`。
 - hover：`bg-slate-50`；窄屏（<640px）评分块移到顶部一行，卡片纵向排列。

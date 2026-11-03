@@ -27,3 +27,4 @@ npm-debug.log*
 # test / coverage
 coverage/
 .vitest/
+.cache/

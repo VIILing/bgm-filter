@@ -59,3 +59,16 @@ export interface StatsDto {
 }
 
 export const PAGE_SIZE = 50;
+
+/**
+ * 卡片封面 URL。三个尺寸都由官方 API 的 `images` 原样取用：
+ * grid = /r/100、small = /r/200、common = /r/400；浏览器直连 lain.bgm.tv。
+ */
+export interface CoverUrls {
+  grid: string;
+  small: string;
+  common: string;
+}
+
+/** 单次 `subject.covers` 允许的最大 id 数（与搜索页每页条目数一致）。 */
+export const COVER_IDS_MAX = 50;
