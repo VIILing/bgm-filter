@@ -66,12 +66,17 @@ export interface SubjectPreviewTag {
   count: number;
 }
 
-/** 悬浮预览数据：简介 + 用户标签（带计数）+ 公共标签（无计数）。 */
+/** 悬浮预览数据：用户标签（带计数）+ 公共标签（无计数）；简介走 `subject.summary` 懒加载。 */
 export interface SubjectPreviewDto {
   id: number;
-  summary: string | null;
   tags: SubjectPreviewTag[];
   metaTags: string[];
+}
+
+/** 简介懒加载结果；`summary=null` 表示无简介（404/空/失败统一降级）。 */
+export interface SubjectSummaryDto {
+  id: number;
+  summary: string | null;
 }
 
 /**

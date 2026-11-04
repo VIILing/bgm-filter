@@ -7,11 +7,12 @@ import {
   type SearchResultDto,
   type StatsDto,
   type SubjectPreviewDto,
+  type SubjectSummaryDto,
   type TagSuggestionDto,
 } from "~/shared/subject-contract";
 import { parsePreviewMetaTags, parsePreviewTags } from "~/server/api/routers/preview-utils";
 import { createTRPCRouter, publicProcedure } from "~/server/api/trpc";
-import { getCovers } from "~/server/cover/cover-service";
+import { getCovers, getSummary } from "~/server/cover/cover-service";
 import {
   getSubjectStats,
   searchSubjects,
@@ -51,8 +52,9 @@ export const subjectRouter = createTRPCRouter({
   ),
 
   /**
-   * 悬浮预览：简介 + 用户标签（带计数，来自 tagsJson）+ 公共标签（metaTagsJson）。
+   * 悬浮预览：用户标签（带计数，来自 tagsJson）+ 公共标签（metaTagsJson）。
    * 仅在鼠标悬浮行时按需请求；找不到条目返回 null。
+   * 简介不再随本接口返回，改由 `subject.summary` 懒加载。
    * tagsJson 解析失败按空数组处理（`parsePreviewTags`），不抛错影响列表。
    */
   preview: publicProcedure
@@ -60,18 +62,27 @@ export const subjectRouter = createTRPCRouter({
     .query(async ({ input, ctx }): Promise<SubjectPreviewDto | null> => {
       const row = await ctx.db.subject.findUnique({
         where: { id: input.id },
-        select: { summary: true, tagsJson: true, metaTagsJson: true },
+        select: { tagsJson: true, metaTagsJson: true },
       });
       if (!row) return null;
 
-      const summary = row.summary?.trim() ?? "";
       return {
         id: input.id,
-        summary: summary.length > 0 ? summary : null,
         tags: parsePreviewTags(row.tagsJson),
         metaTags: parsePreviewMetaTags(row.metaTagsJson),
       };
     }),
+
+  /**
+   * 简介懒加载：缓存（cover_cache）命中优先 → 未命中 getSubject 回源（与封面同源）。
+   * 永不抛错；404 / 网络 / 熔断 / 空 → `summary:null`。
+   */
+  summary: publicProcedure
+    .input(z.object({ id: z.number().int().positive() }))
+    .query(async ({ input }): Promise<SubjectSummaryDto> => ({
+      id: input.id,
+      summary: await getSummary(input.id),
+    })),
 
   /**
    * 批量取封面 URL（最多 50 个 id，可重复/含非法值，服务端会清洗）。

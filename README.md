@@ -34,23 +34,28 @@ pnpm install
 pnpm db:generate
 pnpm db:push
 
-# 3. 准备数据（首次）
-#    下载并解压到 dump-db/，确保 dump-db/subject.jsonlines 存在
-#    https://github.com/bangumi/Archive/releases/tag/archive
-pnpm db:import          # 约 27 秒，生成 prisma/dev.db（740 MB，含简介原文约 363 MB）
+# 3. 准备数据（首次，任选其一）
+#    方式 A（推荐，不下载不复制）：直读共享目录
+#      echo 'DUMP_DIR="/mnt/hgfs/bgm-filter/dump-db"' >> .env.local
+#    方式 B（本地下载）：约 449 MB zip → 解压约 1.9 GB
+#      下载地址见 docs/db-download-url.txt（或 https://github.com/bangumi/Archive/releases/tag/archive）
+#      mkdir -p dump-db && cd dump-db
+#      curl -L -o dump.zip "https://github.com/bangumi/Archive/releases/download/archive/dump-2026-10-27.210404Z.zip"
+#      unzip -o dump.zip && cd ..
+pnpm db:import          # 约 27 秒，生成 prisma/dev.db（简介 summary 不再入库）
 
 # 4. 启动
-pnpm dev                # http://localhost:3000
+pnpm dev                # http://localhost:8004
 ```
 
 > `dump-db/`（约 1.9 GB）与 `prisma/dev.db` 已在 `.gitignore` 中，不会提交。
-> 环境变量 `DUMP_DIR` 可覆盖 dump 目录（默认 `dump-db`）。
+> `DUMP_DIR` 可覆盖 dump 目录：绝对路径直接生效、相对路径相对仓库根、默认 `dump-db`；`.env.local` 优先于 `.env`。
 
 ## 命令
 
 | 命令 | 说明 |
 | --- | --- |
-| `pnpm dev` | 开发服务器（3000） |
+| `pnpm dev` | 开发服务器（8004） |
 | `pnpm build` / `pnpm start` | 生产构建 / 启动 |
 | `pnpm typecheck` | `tsc --noEmit` |
 | `pnpm test` | Vitest（DSL、编译 SQL、URL 状态、标签插入、真实数据集成测试） |
@@ -83,8 +88,7 @@ primary := "(" expr ")" | tag
 | 有标签条目 | 422,912（标签去重 91,909） |
 | 标签关联 | 2,267,357（Σ 每条目 `tags ∪ meta_tags` 去重） |
 | 有评分 / 无日期 | 287,448 / 53,871 |
-| 有简介 | 575,804（平均 661 B，最长 15,130 字符） |
-| 导入耗时 / DB 体积 | 27.3 s / 740 MB（含简介原文约 363 MB） |
+| 导入耗时 / DB 体积 | 约 27 s（summary 不再入库，体积回落；实测值见 `docs/data-report.md`） |
 
 > 注：`docs/requirements.md` 早期版本预估「约 500 万标签关联」有误；dump 中 `tags` 数组实际均值约 2.8 个，实测与独立扫描一致为 2,267,357，详见 `docs/data-report.md`。
 

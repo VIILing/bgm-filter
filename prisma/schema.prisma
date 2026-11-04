@@ -12,7 +12,6 @@ model Subject {
   type         Int      // 1漫画 2动画 3音乐 4游戏 6三次元
   name         String
   nameCn       String?
-  summary      String?  // 条目简介（不截断），来自 dump summary
   date         String?  // 原始 "YYYY-MM-DD"，可能为 null
   year         Int?     // date 前 4 位数字；无效为 null
   score        Float    @default(0)   // 0 表示无评分

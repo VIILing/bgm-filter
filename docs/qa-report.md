@@ -989,3 +989,124 @@ $ tsc --noEmit                        # 无输出，exit 0
 | 截图 | ✅ | `docs/screenshots/09-preview-qa-v16.png` |
 
 **最终结论：V1.6 通过验收、无回归**。滚轮 bug 已按预期修复，面板尺寸/位置与声称一致；主要新增风险是放大后的面板遮挡内容列右半（含筛选卡右侧控件）与 768–1024 区间未覆盖，属设计取舍/未验证项，不阻断验收。
+
+---
+
+## 9. Round 2 验收（端口 / dump 可配置 / summary 懒加载）
+
+> 依据：`docs/round2-requirements.md` §1/§5 + QA 上轮调研报告 §5.1。
+> 环境：Linux / Node v27.0.0-alpha / pnpm 12.16.1；`node_modules` 已装、`prisma/dev.db` 已重导（无 summary，**311.8 MB**）、`.env.local` 配 `DUMP_DIR`、`/mnt/hgfs/bgm-filter/dump-db` 可见（subject.jsonlines 993 MB）。
+> 约束遵守：全程未改业务源码；仅更新本报告；token 未打印（`.env.local` 仅 `DUMP_DIR`，无 `BGM_API_TOKEN`，匿名态验收）。
+
+### 9.1 结论
+
+**✅ 通过。** 三改动逐条验收通过；门禁三连全绿。发现 1 项「非阻断偏差」（端口 8004 实绑 0.0.0.0）与 1 项「环境注意」（测试需 `TMPDIR` 指向工作区），见 §9.6/§9.7。
+
+### 9.2 A 门禁三连
+
+| 项 | 命令 | 结果 |
+| --- | --- | --- |
+| 单元/集成测试 | `pnpm test` | ✅ **13 文件 / 184 用例全绿**（原 171 + 新增 13）；集成测试**未 skip**，跑真库（Subject 700,108 行） |
+| 类型检查 | `pnpm typecheck` | ✅ `tsc --noEmit` exit 0，无输出 |
+| 生产构建 | `pnpm build` | ✅ exit 0；`/` 静态预渲染，First Load JS **156 kB** |
+
+```text
+$ pnpm test
+ Test Files  13 passed (13)
+      Tests  184 passed (184)
+   Duration  8.58s
+$ pnpm typecheck
+$ tsc --noEmit            # 无输出，exit 0
+$ pnpm build
+ ✓ Compiled successfully in 7.3s
+ ✓ Generating static pages (4/4)
+ + First Load JS shared by all  102 kB
+```
+
+> **环境注意（非代码缺陷）**：首次 `pnpm test` 出现集成测试 2 条失败（`(科幻|奇幻)&!R18` 与 `分页 page=9999`），报 `Code: 14 unable to open database file`；根因是 SQLite 大 `EXCEPT`/大 `OFFSET` 排序需临时文件，而**未设 `TMPDIR` 时临时目录被沙箱拦截**（node:sqlite 与 Prisma 均复现）。设 `TMPDIR=$PWD/.tmp SQLITE_TMPDIR=$PWD/.tmp` 后 184/184 全绿。基线 Round 1 为 171 全绿，本处 2 条非回归，属本环境临时目录约束（AGENTS.md §10 已有同类记录）。
+
+### 9.3 B 需求 1 端口
+
+| 项 | 实测 | 结论 |
+| --- | --- | --- |
+| `pnpm dev`（脚本 `next dev -p 8004`） | `ss -ltn` → `*:8004`；`curl 127.0.0.1:8004/` → **200**（Ready 1.9s） | ✅ 端口 8004 生效 |
+| 对外 `pnpm exec next dev -H 0.0.0.0 -p 9004` | `ss -ltn` → `0.0.0.0:9004`；`curl 127.0.0.1:9004/` 与 `curl 192.168.88.100:9004/` 均 **200** | ✅ 9004 绑 0.0.0.0、外网可达 |
+| 端口登记 | `~/port-list.txt` 含 `localhost:8004,bgm-filter开发端口`、`0.0.0.0:9004,bgm-filter对外端口` | ✅ |
+| 测试后清理 | 8004/9004 已全部释放、无 `next dev` 残留 | ✅ |
+
+> ⚠️ **偏差（非阻断）**：`next dev -p 8004` 在 Next 15 默认即绑 **0.0.0.0**（Next 自身日志同时给出 `Local` 与 `Network: 192.168.88.100:8004`），并非 §1.1「8004 绑回环」的字面要求。功能无碍（端口号正确、可访问）；若需严格「仅本机」，应改脚本为 `next dev -p 8004 -H 127.0.0.1`。
+
+### 9.4 C 需求 2 dump 可配置 / 直读不复制
+
+| 项 | 实测 | 结论 |
+| --- | --- | --- |
+| 无本地副本 | `ls -la | grep -i dump` 为空；仓库根无 `dump-db/` | ✅ |
+| git 卫生 | `git status` 不含 `.env.local` / `prisma/*.db` / `dump-db/` / `.cache/` | ✅ |
+| 直读共享目录 | `docs/data-report.md` 数据源行 = `/mnt/hgfs/bgm-filter/dump-db/subject.jsonlines`（947.7 MB，700,108 行） | ✅ |
+| 不复制（静态核） | `grep copyFileSync/cpSync/renameSync` 于 `import-dump.mjs` 无命中；对 dump 仅 `createReadStream/existsSync/statSync`（只读） | ✅ |
+| 可配置 | `.env.local` 设 `DUMP_DIR`；脚本 `resolveDumpPath`（绝对路径原样、相对路径相对 ROOT、默认 `dump-db`）+ 显式读 `.env.local` | ✅（代码核对） |
+| 重导结果 | `dev.db` = 700,108 / 91,909 / 2,267,357，**311.8 MB** | ✅ |
+
+### 9.5 D 需求 3 summary 懒加载
+
+**DB 层（简介不再入库）**
+
+| 项 | 实测 | 结论 |
+| --- | --- | --- |
+| `Subject` 无 summary 列 | `PRAGMA table_info("Subject")` 列 = `id,type,name,nameCn,date,year,score,scoreVotes,rank,nsfw,favoriteJson,tagsJson,metaTagsJson`（无 summary） | ✅ |
+| `SELECT summary` 报错 | `no such column: summary` | ✅ |
+| import/报告无 summary | `import-dump.mjs`、`docs/data-report.md` 均无 summary 引用 | ✅ |
+| DB 体积回落 | 740 MB → **311.8 MB**（移除 summary 原文 362.9 MB） | ✅ |
+
+**接口层（preview 拆接口 + summary 懒加载，9004 实测）**
+
+| 请求 | 实测 | 结论 |
+| --- | --- | --- |
+| `subject.preview` id=62229 | `{id, tags:[任天堂 2216, …10 项], metaTags:[游戏,NS,AAVG,WiiU,NS2]}`，**无 summary 字段** | ✅ 契约一致 |
+| `subject.summary` id=62229（冷缓存→回源） | 返回非空简介（塞尔达 BotW，中日文），**0.178s** | ✅ 回源一次 |
+| `subject.summary` id=62229（第二次） | 同值，**0.023s** | ✅ 命中缓存、0 外呼 |
+| `subject.summary` id=99999999（404） | `{"summary":null}`，HTTP 200 不抛错；首次 2.458s、二次 **0.035s** | ✅ 404→null、负缓存不重试 |
+| `cover_cache` v4 | `user_version=4`；列含 `summary/summaryFetched`；62229 行 `summaryFetched=1, missing=0, reason=ok` | ✅ 同源共缓存 |
+| 外网可达性 | `api.bgm.tv/v0/subjects/62229` 直连 200（0.38s） | ✅ 环境可联网 |
+
+**前端层**
+
+- `HoverPreview.tsx` 代码核对：拆 `subject.preview`（tags，本地 DB，`retry:1`）与 `subject.summary`（懒加载，`retry:false`）两个 `useQuery`；简介区 `SummarySkeleton`「正在加载简介…」→ 有值渲染 / null→「暂无简介」；标签区独立骨架。与 §2.3 一致，且 `pnpm build` 通过（类型/接线一致）。
+- ✅ **UI 运行时已实测（Playwright headless，chromium 156.0.8078.4 / Playwright chromium v1248）**：
+  - 首页加载 **50** 条结果卡片；悬浮结果行 → 右侧 `[data-hover-preview]` 面板出现。
+  - 简介懒加载三态：`[data-preview-summary]` 先显示「正在加载简介…」骨架 → 最终渲染简介文本（第 3 行《Xenoblade2 原声》简介非空；空简介条目则「暂无简介」）。骨架态在冷缓存首次实拍观察到（`是`），并以「对 `subject.summary` 注入 2.5s 路由延迟」确定性复现并截图（暖缓存下骨架一闪而过属预期——封面加载已预热 summary）。
+  - 标签区渲染：`[data-preview-tags]` 30 个 chip、公共标签正常。
+  - 点击面板不触发外链跳转：`page.url()` 不变、`context.pages()` 数不变。
+  - 滚轮归属内部容器：面板内 wheel 页面 `scrollY` 不变；移出面板后页面 wheel 正常滚动（`0 → 800`）。
+  - **console error / pageerror 均 0**（多轮复测）。
+  - 截图：`docs/screenshots/round2-home.png`（首页）、`round2-preview-loading.png`（骨架态）、`round2-preview-loaded.png`（完成态）、`round2-preview.png`（首次实拍完成态）。
+  - 环境说明：浏览器二进制原本缺 12 个系统共享库；QA 先用 `apt-get download` + `dpkg-deb -x` + `LD_LIBRARY_PATH` 本地解包跑通，随后用户于宿主侧 `playwright install-deps chromium` 补齐依赖，去掉 `LD_LIBRARY_PATH` 亦直接启动。`@playwright/test@1.64.1` 已作为 devDependency 保留（长期是否保留由 PM 决定）。
+- ✅ **E2E 已固化为 `pnpm test:e2e`**：新增 `playwright.config.ts`（`testDir: "e2e"`、`baseURL: http://127.0.0.1:8004`、`webServer` 自动起 `pnpm dev` 并注入 `TMPDIR` 到仓库内 `.tmp/`）与 `e2e/preview.spec.ts`（3 条用例：50 条卡片 / 悬浮预览骨架→简介→标签 / 面板不跳转+滚轮归内部，均断言 0 console/pageerror）。实跑两次 `pnpm test:e2e` 均 **3 passed**（18.1s / 17.0s，幂等）。运行前置：浏览器已装（`PLAYWRIGHT_BROWSERS_PATH` 指向 `.playwright-browsers/`）且系统库已装（宿主侧 `playwright install-deps chromium`）。`test-results/`、`playwright-report/`、`.playwright-browsers/`、`.browser-libs/`、`.tmp/` 均已 gitignore。
+
+### 9.6 发现的问题（非阻断）
+
+| 项 | 说明 | 建议 |
+| --- | --- | --- |
+| P1 端口 8004 绑 0.0.0.0 | `next dev -p 8004` 在 Next 15 默认绑全接口，与「开发端口绑回环」字面不符 | 如需严格仅本机：`next dev -p 8004 -H 127.0.0.1`（后端/PM 决策） |
+| 集成测试未加「无 summary 列」断言 | round2-requirements §5 建议新增的 `PRAGMA table_info("Subject")` 断言未见落地（集成测试仍无 summary/PRAGMA 断言） | 建议后端补 1 条只读断言，防 summary 回写 Subject |
+
+### 9.7 已知风险（沿用 + 新增）
+
+| 风险 | 说明 |
+| --- | --- |
+| 测试需 `TMPDIR` 指向工作区 | 本沙箱未设 `TMPDIR` 时，SQLite 大排序/EXCEPT 的临时文件被拦截 → `unable to open database file`；CI 或新环境建议 `TMPDIR=$PWD/.tmp pnpm test` |
+| 简介冷启动依赖外网 | `subject.summary` 首次 hover 冷缓存会回源 `api.bgm.tv`（受 4 req/s 限速 + 5s 超时 + 熔断）；断网/熔断 → summary=null，前端「暂无简介」（接口不抛错，已验 404 路径） |
+| 缓存跨 dump 扩大 | summary 与封面同缓存行且正缓存永久；换 dump 后 summary 变更不失效（沿用已知「缓存跨 dump」，现扩展到简介） |
+| NSFW 简介依赖 token | 匿名态上游对 NSFW 条目 404 → summary=null（与封面同）；需 `BGM_API_TOKEN` 且重启 dev 才可取 |
+
+### 9.8 验收结论
+
+| 项 | 结论 |
+| --- | --- |
+| 门禁三连（test/typecheck/build） | ✅ 184/184、0 error、build 通过 |
+| 需求 1 端口 | ✅ 8004/9004 均 200；⚠️ 8004 实绑 0.0.0.0（见 P1） |
+| 需求 2 dump 可配置 | ✅ 直读 `/mnt/hgfs`、无副本、无 copy 调用、git 卫生 |
+| 需求 3 summary 懒加载 | ✅ DB 无 summary 列、preview 拆接口、summary 冷回源/暖命中/404 null、cover_cache v4 |
+| UI 运行时 | ✅ 已实测（Playwright headless 156.0.8078.4）：50 条、面板出现、骨架→简介、标签、不跳转、滚轮归内部、0 console/pageerror |
+
+**最终结论：Round 2 三改动通过验收；无阻断缺陷。** 遗留 2 项非阻断建议（8004 绑回环、集成测试补 summary 列断言）与 4 项已知风险，不影响本次交付。

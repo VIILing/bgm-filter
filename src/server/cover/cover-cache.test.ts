@@ -92,7 +92,7 @@ afterEach(() => {
 });
 
 describe("CoverCache 负缓存迁移", () => {
-  it("v0 旧库：清空负缓存、保留正缓存并写入 user_version=3", () => {
+  it("v0 旧库：清空负缓存、保留正缓存并写入当前版本", () => {
     const path = createTempCachePath();
     const now = Date.now();
     seedCache(
@@ -124,6 +124,8 @@ describe("CoverCache 负缓存迁移", () => {
       grid: "g1",
       small: "s1",
       common: "c1",
+      summary: null,
+      summaryFetched: false,
     });
     cache.close();
 
@@ -145,6 +147,8 @@ describe("CoverCache 负缓存迁移", () => {
     expect(Number(counts.total)).toBe(1);
     expect(Number(counts.missing)).toBe(0);
     expect(columns.some((column) => column.name === "reason")).toBe(true);
+    expect(columns.some((column) => column.name === "summary")).toBe(true);
+    expect(columns.some((column) => column.name === "summaryFetched")).toBe(true);
   });
 
   it("v2 → v3：清空旧负缓存、保留正缓存并升级版本", () => {
@@ -176,6 +180,59 @@ describe("CoverCache 负缓存迁移", () => {
     expect(readVersion(path)).toBe(COVER_CACHE_VERSION);
   });
 
+  it("v3 → v4：仅补列、不清负缓存", () => {
+    const path = createTempCachePath();
+    const now = Date.now();
+
+    // 造一个真实 v3 库：含 reason 列，正缓存 reason='ok'、负缓存 reason='not_found'。
+    const v3 = new DatabaseSync(path);
+    v3.exec(`
+      CREATE TABLE cover_cache (
+        id        INTEGER PRIMARY KEY,
+        grid      TEXT,
+        small     TEXT,
+        common    TEXT,
+        "fetchedAt" INTEGER NOT NULL,
+        missing   INTEGER NOT NULL DEFAULT 0,
+        reason    TEXT NOT NULL DEFAULT 'unknown'
+      )
+    `);
+    const insert = v3.prepare(
+      `INSERT INTO cover_cache (id, grid, small, common, "fetchedAt", missing, reason)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    );
+    insert.run(1, "g1", "s1", "c1", now, 0, "ok");
+    insert.run(226254, null, null, null, now, 1, "not_found");
+    v3.exec("PRAGMA user_version = 3");
+    v3.close();
+
+    const cache = openCache(path);
+    const hits = cache.getMany(
+      [1, 226254],
+      now,
+      NEGATIVE_TTL_MS,
+      NOT_FOUND_TTL_MS,
+    );
+    // v3 的正/负缓存都保留；旧行 summary 未知（summaryFetched=false，等按需回源）。
+    expect([...hits.keys()].sort((a, b) => a - b)).toEqual([1, 226254]);
+    expect(hits.get(1)).toMatchObject({
+      missing: false,
+      reason: "ok",
+      grid: "g1",
+      summary: null,
+      summaryFetched: false,
+    });
+    expect(hits.get(226254)).toMatchObject({
+      missing: true,
+      reason: "not_found",
+      summary: null,
+      summaryFetched: false,
+    });
+    cache.close();
+
+    expect(readVersion(path)).toBe(COVER_CACHE_VERSION);
+  });
+
   it("重复打开不重复清理：迁移后新增的负缓存会保留", () => {
     const path = createTempCachePath();
     const now = Date.now();
@@ -199,7 +256,7 @@ describe("CoverCache 负缓存迁移", () => {
     // 迁移后写入的新负缓存（例如官方确认无图）不应在下一次打开时被清掉
     const second = openCache(path);
     second.setMany([
-      { id: 777, urls: null, fetchedAt: now, reason: "not_found" },
+      { id: 777, urls: null, summary: null, fetchedAt: now, reason: "not_found" },
     ]);
     second.close();
 

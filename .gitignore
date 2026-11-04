@@ -31,3 +31,12 @@ npm-debug.log*
 coverage/
 .vitest/
 .cache/
+
+# playwright 浏览器与本地临时目录（E2E 验证用，绝不入库）
+.playwright-browsers/
+.tmp/
+test-results/
+playwright-report/
+
+# 浏览器依赖库本地解包（E2E 临时验证用，绝不入库）
+.browser-libs/

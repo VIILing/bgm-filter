@@ -1,12 +1,16 @@
 /**
- * 封面 URL 解析服务。
+ * 封面 URL + 简介解析服务。
  *
- * 产品决策：只解析并缓存「id → {grid,small,common} URL」，图片字节一律不落盘、
- * 不经服务端代理，由浏览器直连 `lain.bgm.tv`。本模块因此只有字符串级缓存，
- * 且**永不向前端抛错**：任何外部/缓存异常都降级为 `null`（卡片显示占位）。
+ * 产品决策：只解析并缓存「id → {grid,small,common} URL」与「id → summary 简介」，
+ * 图片字节一律不落盘、不经服务端代理，由浏览器直连 `lain.bgm.tv`。本模块只有
+ * 字符串级缓存，且**永不向前端抛错**：任何外部/缓存异常都降级为 `null`。
+ *
+ * summary 与封面同源：`getSubject(id)` 一次返回 `images` 与 `summary`，二者写进
+ * 同一条 cover_cache 行；`getCovers` 取图时顺带缓存 summary（封面加载即预热简介），
+ * `getSummary` 命中缓存时零外呼。
  *
  * 所有 Bangumi 外部请求（UA / token / 超时 / 限速 / 并发 / 重试 / 熔断）都委托给
- * `~/server/bgm/bgm-client`，本模块只保留输入清洗、缓存读写与 `images` 容错。
+ * `~/server/bgm/bgm-client`，本模块只保留输入清洗、缓存读写与字段容错。
  */
 
 import {
@@ -64,11 +68,15 @@ export interface CoverService {
     ids: number[],
     deps?: CoverServiceDeps,
   ): Promise<Record<string, CoverUrls | null>>;
+  /** 单条简介懒加载；`null` = 无简介 / 404 / 失败。永不抛错。 */
+  getSummary(id: number, deps?: CoverServiceDeps): Promise<string | null>;
   close(): void;
 }
 
 interface FetchOutcome {
   urls: CoverUrls | null;
+  /** 简介（`null` = 无简介 / 404 / 失败）；与 urls 来自同一次 getSubject。 */
+  summary: string | null;
   /** `true` = 确定结果（有封面 / 无封面 / 404），可写缓存。 */
   cacheable: boolean;
   /** 负缓存原因：404 与 200 无图使用不同 TTL。 */
@@ -102,6 +110,15 @@ export function pickCoverUrls(images: unknown): CoverUrls | null {
     small: small ?? common ?? grid!,
     common: common ?? small ?? grid!,
   };
+}
+
+/**
+ * 纯函数：从官方 subject 响应取简介。容错缺失 / 非字符串 / 空白 → null（无简介）。
+ */
+export function pickSummary(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 function readUrl(value: unknown): string | null {
@@ -168,6 +185,21 @@ class CoverServiceEngine implements CoverService {
     }
   }
 
+  async getSummary(
+    id: number,
+    deps: CoverServiceDeps = {},
+  ): Promise<string | null> {
+    if (!Number.isSafeInteger(id) || id <= 0) return null;
+
+    try {
+      return await this.resolveSummary(id, deps.client ?? this.client);
+    } catch (error) {
+      // 永不抛错：缓存/解析/任何意外都降级为 null（前端显示「暂无简介」）。
+      this.warn("[cover] 简介解析失败，降级为 null", error);
+      return null;
+    }
+  }
+
   close(): void {
     try {
       this.cache?.close();
@@ -220,6 +252,7 @@ class CoverServiceEngine implements CoverService {
         writes.push({
           id,
           urls: outcome.urls,
+          summary: outcome.summary,
           fetchedAt: this.clock.now(),
           reason: outcome.reason,
         });
@@ -229,6 +262,42 @@ class CoverServiceEngine implements CoverService {
     this.warnFailureSummary(outcomes, fetchable.length);
     this.writeCache(writes);
     return toRecord(ids, resolved);
+  }
+
+  /**
+   * 取单条简介：缓存优先（summaryFetched=1 时命中，即使 summary 为 null），
+   * 未命中 / 旧正缓存（summaryFetched=0）则回源一次 getSubject，与封面一起写缓存。
+   */
+  private async resolveSummary(
+    id: number,
+    client: CoverClient,
+  ): Promise<string | null> {
+    const now = this.clock.now();
+    const cache = this.getCache();
+    if (cache) {
+      try {
+        const entry = cache
+          .getMany([id], now, this.negativeTtlMs, this.notFoundTtlMs)
+          .get(id);
+        if (entry && entry.summaryFetched) return entry.summary;
+      } catch (error) {
+        this.warn("[cover] 读取简介缓存失败，继续回源", error);
+      }
+    }
+
+    const outcome = await this.fetchOne(id, client);
+    if (outcome.cacheable) {
+      this.writeCache([
+        {
+          id,
+          urls: outcome.urls,
+          summary: outcome.summary,
+          fetchedAt: this.clock.now(),
+          reason: outcome.reason,
+        },
+      ]);
+    }
+    return outcome.summary;
   }
 
   /** 单批只打一行汇总，避免逐条刷屏；失败不写缓存，下次仍可重试。 */
@@ -256,12 +325,14 @@ class CoverServiceEngine implements CoverService {
     try {
       const subject: BgmSubject | null = await client.getSubject(id);
       if (subject === null) {
-        // 404 是确定结果：写 1 天负缓存，便于补 token 后重试。
-        return this.outcome(null, true, false, false, "not_found");
+        // 404 是确定结果：写 1 天负缓存，便于补 token 后重试；summary 置空。
+        return this.outcome(null, null, true, false, false, "not_found");
       }
       const urls = pickCoverUrls(subject.images);
+      const summary = pickSummary(subject.summary);
       return this.outcome(
         urls,
+        summary,
         true,
         false,
         false,
@@ -270,24 +341,25 @@ class CoverServiceEngine implements CoverService {
     } catch (error) {
       if (error instanceof BgmCircuitOpenError) {
         // 熔断短路：没发外部请求，不能当成「无图」写缓存。
-        return this.outcome(null, false, true, true);
+        return this.outcome(null, null, false, true, true);
       }
       // 兼容客户端直接把 404 作为异常抛出的实现（默认 getSubject 已映射为 null）。
       if (error instanceof BgmHttpError && error.status === 404) {
-        return this.outcome(null, true, false, false, "not_found");
+        return this.outcome(null, null, true, false, false, "not_found");
       }
-      return this.outcome(null, false, true, false);
+      return this.outcome(null, null, false, true, false);
     }
   }
 
   private outcome(
     urls: CoverUrls | null,
+    summary: string | null,
     cacheable: boolean,
     failed: boolean,
     skipped: boolean,
     reason?: "ok" | "no_image" | "not_found",
   ): FetchOutcome {
-    return { urls, cacheable, failed, skipped, reason };
+    return { urls, summary, cacheable, failed, skipped, reason };
   }
 
   private getCache(): CoverCache | null {
@@ -348,6 +420,18 @@ export function getCovers(
   deps?: CoverServiceDeps,
 ): Promise<Record<string, CoverUrls | null>> {
   return getDefaultService().getCovers(ids, deps);
+}
+
+/**
+ * 生产入口：单条简介懒加载。tRPC router 调用；永不抛错。
+ *
+ * `deps.client` 仅用于测试/脚本临时覆盖默认 `bgmClient`，生产路由无需传参。
+ */
+export function getSummary(
+  id: number,
+  deps?: CoverServiceDeps,
+): Promise<string | null> {
+  return getDefaultService().getSummary(id, deps);
 }
 
 /** 关闭默认实例的 SQLite 句柄（测试清理 / 进程退出）。 */

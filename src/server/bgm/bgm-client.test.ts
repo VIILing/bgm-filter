@@ -443,6 +443,28 @@ describe("BgmClient 限速与并发", () => {
   });
 });
 
+describe("BgmClient summary 透传", () => {
+  it("getSubject 原样透传官方 summary 字段", async () => {
+    const { fetchImpl } = createFetch(() =>
+      jsonResponse({ id: 1, name: "x", summary: "一段简介" }),
+    );
+    const { client } = createTestClient({ fetch: fetchImpl });
+
+    await expect(client.getSubject(1)).resolves.toEqual({
+      id: 1,
+      name: "x",
+      summary: "一段简介",
+    });
+  });
+
+  it("官方缺 summary 时返回体不含该字段（可选）", async () => {
+    const { fetchImpl } = createFetch(() => jsonResponse({ id: 2, name: "y" }));
+    const { client } = createTestClient({ fetch: fetchImpl });
+
+    await expect(client.getSubject(2)).resolves.toEqual({ id: 2, name: "y" });
+  });
+});
+
 describe("BgmClient 错误信息脱敏", () => {
   const secret = "super-secret-token";
 

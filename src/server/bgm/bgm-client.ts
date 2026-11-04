@@ -63,6 +63,8 @@ export interface BgmSubject {
   name: string;
   name_cn?: string | null;
   images?: BgmSubjectImages | null;
+  /** 条目简介；官方可能缺字段或为空串。可选字段，不破坏现有 fake 类型。 */
+  summary?: string | null;
 }
 
 export interface BgmClientOptions {

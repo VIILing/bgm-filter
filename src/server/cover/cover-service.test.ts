@@ -24,6 +24,7 @@ import {
   COVER_NOT_FOUND_TTL_MS,
   createCoverService,
   pickCoverUrls,
+  pickSummary,
   type CoverClient,
   type CoverClock,
   type CoverService,
@@ -58,6 +59,7 @@ function subjectFor(id: number): BgmSubject {
     name: `subject ${id}`,
     name_cn: `条目 ${id}`,
     images: coverUrls(id),
+    summary: `简介 ${id}`,
   };
 }
 
@@ -66,6 +68,7 @@ function subjectWithoutImages(id: number): BgmSubject {
     id,
     name: `subject ${id}`,
     images: { grid: "", small: "", common: "" },
+    summary: `无图但有简介 ${id}`,
   };
 }
 
@@ -151,6 +154,25 @@ describe("pickCoverUrls", () => {
     expect(
       pickCoverUrls({ grid: "  ", small: null, common: "c" }),
     ).toEqual({ grid: "c", small: "c", common: "c" });
+  });
+});
+
+describe("pickSummary", () => {
+  it("正常字符串原样返回", () => {
+    expect(pickSummary("这是一段简介")).toBe("这是一段简介");
+  });
+
+  it("首尾空白被裁掉", () => {
+    expect(pickSummary("  简介  ")).toBe("简介");
+  });
+
+  it("缺失 / null / 非字符串 / 空串 / 纯空白 → null", () => {
+    expect(pickSummary(undefined)).toBeNull();
+    expect(pickSummary(null)).toBeNull();
+    expect(pickSummary(42)).toBeNull();
+    expect(pickSummary({ text: "x" })).toBeNull();
+    expect(pickSummary("")).toBeNull();
+    expect(pickSummary("   ")).toBeNull();
   });
 });
 
@@ -302,6 +324,82 @@ describe("cover-service 缓存", () => {
       "2": null,
       "3": coverUrls(3),
     });
+  });
+});
+
+describe("cover-service 简介懒加载（getSummary）", () => {
+  it("getCovers 后命中缓存：summary 与封面一起预热，零外呼", async () => {
+    const { client, calls } = createFakeClient((id) => subjectFor(id));
+    const { service } = createTestService({ client });
+
+    await service.getCovers([1]);
+    const summary = await service.getSummary(1);
+
+    expect(summary).toBe("简介 1");
+    expect(calls).toEqual([1]); // 仅封面那次回源，getSummary 命中缓存
+  });
+
+  it("冷路径：直接 getSummary 回源一次并缓存，第二次命中", async () => {
+    const { client, calls } = createFakeClient((id) => subjectFor(id));
+    const { service } = createTestService({ client });
+
+    expect(await service.getSummary(7)).toBe("简介 7");
+    expect(await service.getSummary(7)).toBe("简介 7");
+    expect(calls).toEqual([7]);
+  });
+
+  it("无简介（空）→ null，且不重复回源（summaryFetched=1 生效）", async () => {
+    const { client, calls } = createFakeClient((id) => ({
+      ...subjectFor(id),
+      summary: "",
+    }));
+    const { service } = createTestService({ client });
+
+    expect(await service.getSummary(9)).toBeNull();
+    expect(await service.getSummary(9)).toBeNull();
+    expect(calls).toEqual([9]);
+  });
+
+  it("404 → null 且不重复回源（负缓存 summaryFetched=1）", async () => {
+    const { client, calls } = createFakeClient(() => null);
+    const { service } = createTestService({ client });
+
+    expect(await service.getSummary(19)).toBeNull();
+    expect(await service.getSummary(19)).toBeNull();
+    expect(calls).toEqual([19]);
+  });
+
+  it("无图但有简介（no_image）也缓存 summary", async () => {
+    const { client, calls } = createFakeClient((id) => subjectWithoutImages(id));
+    const { service } = createTestService({ client });
+
+    expect(await service.getSummary(29)).toBe("无图但有简介 29");
+    expect(await service.getSummary(29)).toBe("无图但有简介 29");
+    expect(calls).toEqual([29]);
+  });
+
+  it("网络失败 → null 且不写缓存，下次重试", async () => {
+    let broken = true;
+    const { client, calls } = createFakeClient((id) => {
+      if (broken) throw new Error("ECONNRESET");
+      return subjectFor(id);
+    });
+    const { service } = createTestService({ client });
+
+    expect(await service.getSummary(3)).toBeNull();
+    broken = false;
+    expect(await service.getSummary(3)).toBe("简介 3");
+    expect(calls).toEqual([3, 3]);
+  });
+
+  it("非法 id → null 且不发请求", async () => {
+    const { client, calls } = createFakeClient((id) => subjectFor(id));
+    const { service } = createTestService({ client });
+
+    expect(await service.getSummary(0)).toBeNull();
+    expect(await service.getSummary(-1)).toBeNull();
+    expect(await service.getSummary(Number.NaN)).toBeNull();
+    expect(calls).toEqual([]);
   });
 });
 

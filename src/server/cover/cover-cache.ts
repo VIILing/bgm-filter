@@ -17,9 +17,12 @@ export const DEFAULT_COVER_CACHE_PATH = ".cache/covers.db";
  * 缓存策略版本，写入 SQLite `PRAGMA user_version`：
  * - v2：取消封面 NSFW 门禁，清空旧 NSFW 负缓存；
  * - v3：负缓存增加原因列（区分 404 / 无图），并清空 v2 阶段遗留的负缓存，
- *   使配置 `BGM_API_TOKEN` 后旧的 404 负缓存不会继续挡住 NSFW 条目。
+ *   使配置 `BGM_API_TOKEN` 后旧的 404 负缓存不会继续挡住 NSFW 条目；
+ * - v4：增加 `summary` / `summaryFetched` 列，与封面同源缓存简介；仅加列，
+ *   **不清任何缓存**（v3 的有效正/负缓存全部保留，旧行 summaryFetched=0 表示
+ *   简介未知，首次请求简介时按需回源）。
  */
-export const COVER_CACHE_VERSION = 3;
+export const COVER_CACHE_VERSION = 4;
 
 /** 负缓存原因；`ok` 仅用于正缓存。 */
 export type CoverCacheReason =
@@ -33,6 +36,10 @@ export interface CoverCacheEntry {
   grid: string | null;
   small: string | null;
   common: string | null;
+  /** 缓存的简介；`summaryFetched=false` 时无意义（尚未取到）。 */
+  summary: string | null;
+  /** true=简介已有定论（有值或确定为空/404）。 */
+  summaryFetched: boolean;
   missing: boolean;
   reason: CoverCacheReason;
   fetchedAt: number;
@@ -42,6 +49,8 @@ export interface CoverCacheEntry {
 export interface CoverCacheWrite {
   id: number;
   urls: CoverUrls | null;
+  /** 简介（`null` 表示无简介或 404）；写入即视为 summaryFetched=1。 */
+  summary: string | null;
   fetchedAt: number;
   /** 负缓存原因；缺省时负缓存按 `unknown`（7 天 TTL）处理。 */
   reason?: CoverCacheReason;
@@ -52,6 +61,8 @@ interface CoverCacheRow {
   grid: string | null;
   small: string | null;
   common: string | null;
+  summary: string | null;
+  summaryFetched: number | bigint;
   fetchedAt: number | bigint;
   missing: number | bigint;
   reason: string | null;
@@ -63,6 +74,8 @@ const CREATE_TABLE_SQL = `
     grid      TEXT,
     small     TEXT,
     common    TEXT,
+    summary   TEXT,
+    summaryFetched INTEGER NOT NULL DEFAULT 0,
     "fetchedAt" INTEGER NOT NULL,
     missing   INTEGER NOT NULL DEFAULT 0,
     reason    TEXT NOT NULL DEFAULT 'unknown'
@@ -70,12 +83,14 @@ const CREATE_TABLE_SQL = `
 `;
 
 const UPSERT_SQL = `
-  INSERT INTO cover_cache (id, grid, small, common, "fetchedAt", missing, reason)
-  VALUES (?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO cover_cache (id, grid, small, common, summary, summaryFetched, "fetchedAt", missing, reason)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   ON CONFLICT(id) DO UPDATE SET
     grid = excluded.grid,
     small = excluded.small,
     common = excluded.common,
+    summary = excluded.summary,
+    summaryFetched = excluded.summaryFetched,
     "fetchedAt" = excluded."fetchedAt",
     missing = excluded.missing,
     reason = excluded.reason
@@ -107,6 +122,7 @@ export class CoverCache {
     }
     this.db.exec(CREATE_TABLE_SQL);
     this.ensureReasonColumn();
+    this.ensureSummaryColumns();
     this.migrate();
   }
 
@@ -121,24 +137,49 @@ export class CoverCache {
     );
   }
 
+  /** v4：补 `summary` / `summaryFetched` 列；旧行 summaryFetched 默认 0（简介未知）。 */
+  private ensureSummaryColumns(): void {
+    const columns = this.db
+      .prepare("PRAGMA table_info(cover_cache)")
+      .all() as unknown as Array<{ name?: string }>;
+    if (!columns.some((column) => column.name === "summary")) {
+      this.db.exec("ALTER TABLE cover_cache ADD COLUMN summary TEXT");
+    }
+    if (!columns.some((column) => column.name === "summaryFetched")) {
+      this.db.exec(
+        "ALTER TABLE cover_cache ADD COLUMN summaryFetched INTEGER NOT NULL DEFAULT 0",
+      );
+    }
+  }
+
   /**
-   * 幂等迁移：v0/v1/v2 → v3 清空全部 `missing=1` 负缓存，保留 `missing=0` 正缓存，
-   * 并把旧正缓存的 reason 补成 `ok`。迁移失败不影响服务：保留原库继续用，下次
-   * 打开会重试，绝不让 covers 接口因缓存迁移报错。
+   * 幂等、分版本迁移：
+   * - v0/v1/v2 → v3：清空全部 `missing=1` 负缓存（NSFW 门禁取消 / 引入 reason），
+   *   并把旧正缓存的 reason 补成 `ok`；
+   * - v3 → v4：仅加 `summary` / `summaryFetched` 列（由 ensureSummaryColumns 完成），
+   *   **不清任何缓存**（v3 的有效正/负缓存全部保留）。
+   *
+   * 迁移失败不影响服务：保留原库继续用，下次打开会重试，绝不让 covers 接口因
+   * 缓存迁移报错。
    */
   private migrate(): void {
     try {
-      if (this.readUserVersion() >= COVER_CACHE_VERSION) return;
+      const current = this.readUserVersion();
+      if (current >= COVER_CACHE_VERSION) return;
 
       this.db.exec("BEGIN IMMEDIATE");
       try {
         // 事务内二次检查：多进程同时打开时，后拿到写锁的进程会看到已迁移版本，
-        // 不会重复删除迁移后新写入的负缓存。
-        if (this.readUserVersion() < COVER_CACHE_VERSION) {
-          this.db.exec("DELETE FROM cover_cache WHERE missing = 1");
-          this.db.exec(
-            "UPDATE cover_cache SET reason = 'ok' WHERE missing = 0 AND reason = 'unknown'",
-          );
+        // 不会重复执行迁移步骤。
+        const version = this.readUserVersion();
+        if (version < COVER_CACHE_VERSION) {
+          if (version < 3) {
+            this.db.exec("DELETE FROM cover_cache WHERE missing = 1");
+            this.db.exec(
+              "UPDATE cover_cache SET reason = 'ok' WHERE missing = 0 AND reason = 'unknown'",
+            );
+          }
+          // v3 → v4 只有加列（已由 ensureSummaryColumns 在事务外完成），不删任何行。
           this.db.exec(`PRAGMA user_version = ${COVER_CACHE_VERSION}`);
         }
         this.db.exec("COMMIT");
@@ -152,7 +193,7 @@ export class CoverCache {
       }
     } catch (error) {
       // 缓存不是关键路径：打印一次，保留旧数据继续服务。
-      console.warn("[cover-cache] 负缓存迁移失败，下次打开重试", error);
+      console.warn("[cover-cache] 迁移失败，下次打开重试", error);
     }
   }
 
@@ -179,7 +220,7 @@ export class CoverCache {
     const placeholders = ids.map(() => "?").join(", ");
     const rows = this.db
       .prepare(
-        `SELECT id, grid, small, common, "fetchedAt", missing, reason
+        `SELECT id, grid, small, common, summary, summaryFetched, "fetchedAt", missing, reason
            FROM cover_cache
           WHERE id IN (${placeholders})`,
       )
@@ -197,6 +238,8 @@ export class CoverCache {
         grid: normalizeText(row.grid),
         small: normalizeText(row.small),
         common: normalizeText(row.common),
+        summary: normalizeText(row.summary),
+        summaryFetched: Number(row.summaryFetched) !== 0,
         missing,
         reason,
         fetchedAt,
@@ -223,6 +266,8 @@ export class CoverCache {
           entry.urls?.grid ?? null,
           entry.urls?.small ?? null,
           entry.urls?.common ?? null,
+          entry.summary ?? null,
+          1, // summaryFetched：每次写入都来自一次已完成的回源，简介已有定论
           entry.fetchedAt,
           entry.urls === null ? 1 : 0,
           reason,

@@ -2,7 +2,7 @@
 /**
  * BGM Filter · Bangumi Archive dump → SQLite 导入器
  * ---------------------------------------------------------------------------
- * 输入: <DUMP_DIR>/subject.jsonlines   (默认 dump-db/subject.jsonlines)
+ * 输入: <DUMP_DIR>/subject.jsonlines   (默认 <ROOT>/dump-db/subject.jsonlines)
  * 输出: DATABASE_URL 指向的 SQLite 库 (默认 prisma/dev.db；表由 `prisma db push` 建好)
  *
  * 规则来源: docs/architecture.md §4（数据模型 + 导入规则）
@@ -12,18 +12,42 @@
  *  - 批量事务 + PRAGMA 调优，结束恢复并 ANALYZE。
  *
  * 环境变量:
- *  - DUMP_DIR       覆盖 dump 目录（默认 ./dump-db）
+ *  - DUMP_DIR       覆盖 dump 目录：绝对路径直接生效，相对路径相对仓库根 ROOT 解析；
+ *                   未设置时回退 <ROOT>/dump-db；.env.local 优先于 .env。
  *  - DATABASE_URL   覆盖数据库；file: 相对路径按 Prisma 语义相对 prisma/ 解析
  */
-import { createReadStream, existsSync, statSync, writeFileSync, mkdirSync } from "node:fs";
+import { createReadStream, existsSync, statSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveDumpPath } from "./resolve-dump-path.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(SCRIPT_DIR, "..");
-const DUMP_DIR = path.resolve(process.cwd(), process.env.DUMP_DIR ?? path.join(ROOT, "dump-db"));
+
+/**
+ * 读取 .env.local 中的某个键（.env.local 优先于 .env）。
+ * `pnpm db:import` 只 `node --env-file=.env`，不会自动加载 .env.local，
+ * 故这里显式读取并覆盖。仅解析简单 `KEY=value` 与双/单引号包裹值，零依赖。
+ */
+function readEnvLocal(key) {
+  const file = path.join(ROOT, ".env.local");
+  if (!existsSync(file)) return undefined;
+  const text = readFileSync(file, "utf8");
+  for (const line of text.split(/\r?\n/)) {
+    const m = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/.exec(line);
+    if (!m || m[1] !== key) continue;
+    let value = m[2];
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    return value;
+  }
+  return undefined;
+}
+
+const DUMP_DIR = resolveDumpPath(readEnvLocal("DUMP_DIR") ?? process.env.DUMP_DIR, ROOT);
 const DUMP_FILE = path.join(DUMP_DIR, "subject.jsonlines");
 
 const BATCH_SUBJECTS = 2000;   // 每个事务的 Subject 数（≈1.2 万条 SubjectTag）
@@ -161,7 +185,6 @@ const scan = {
   scoreGt0: 0, dateNull: 0, yearNull: 0, rankGt0: 0, nsfw: 0,
   bothTags: 0, tagsOnly: 0, metaOnly: 0, noTags: 0, tagTokenCount: 0,
   rawTagEntries: 0, rawMetaEntries: 0, dupInTags: 0, dupAcross: 0,
-  summaryFilled: 0, summaryChars: 0, summaryMaxLen: 0, summaryMaxId: null,
 };
 let badLineSamples = [];
 
@@ -193,16 +216,6 @@ await eachLine(DUMP_FILE, (line) => {
   if (y === null) scan.yearNull++;
   if (typeof rec.rank === "number" && rec.rank > 0) scan.rankGt0++;
   if (rec.nsfw === true) scan.nsfw++;
-
-  // summary：与入库映射同口径（非空字符串才算），用于与 DB 侧交叉校验
-  if (typeof rec.summary === "string" && rec.summary.length > 0) {
-    scan.summaryFilled++;
-    scan.summaryChars += rec.summary.length;
-    if (rec.summary.length > scan.summaryMaxLen) {
-      scan.summaryMaxLen = rec.summary.length;
-      scan.summaryMaxId = rec.id;
-    }
-  }
 
   const hasT = Array.isArray(rec.tags) && rec.tags.length > 0;
   const hasM = Array.isArray(rec.meta_tags) && rec.meta_tags.length > 0;
@@ -286,7 +299,7 @@ markPhase(`写入 Tag（${fmt(tagRows.length)} 个）`);
 
 // --- Pass 2: 写 Subject + SubjectTag ---------------------------------------
 const insSubject = db.prepare(
-  'INSERT INTO "Subject" ("id","type","name","nameCn","summary","date","year","score","scoreVotes","rank","nsfw","favoriteJson","tagsJson","metaTagsJson") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+  'INSERT INTO "Subject" ("id","type","name","nameCn","date","year","score","scoreVotes","rank","nsfw","favoriteJson","tagsJson","metaTagsJson") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
 );
 const insSubjectTag = db.prepare('INSERT INTO "SubjectTag" ("subjectId","tagId") VALUES (?,?)');
 
@@ -326,7 +339,6 @@ await eachLine(DUMP_FILE, (line) => {
     rec.type,
     rec.name,
     typeof rec.name_cn === "string" && rec.name_cn.length > 0 ? rec.name_cn : null,
-    typeof rec.summary === "string" && rec.summary.length > 0 ? rec.summary : null,
     isEmptyDate(rec.date) ? null : rec.date,
     mapYear(rec.date),
     typeof rec.score === "number" && Number.isFinite(rec.score) ? rec.score : 0,
@@ -390,8 +402,6 @@ const dbDateNull = q('SELECT COUNT(*) AS c FROM "Subject" WHERE "date" IS NULL')
 const dbYearNull = q('SELECT COUNT(*) AS c FROM "Subject" WHERE "year" IS NULL').c;
 const dbRank = q('SELECT COUNT(*) AS c FROM "Subject" WHERE "rank" IS NOT NULL').c;
 const dbNsfw = q('SELECT COUNT(*) AS c FROM "Subject" WHERE "nsfw" = 1').c;
-const dbSummary = q('SELECT COUNT(*) AS filled, COALESCE(SUM(LENGTH(CAST("summary" AS BLOB))),0) AS bytes, COALESCE(MAX(LENGTH("summary")),0) AS maxChars FROM "Subject" WHERE "summary" IS NOT NULL');
-const dbSummaryNull = counts.subjects - dbSummary.filled;
 const dbYearRange = q('SELECT MIN("year") AS lo, MAX("year") AS hi FROM "Subject" WHERE "year" IS NOT NULL');
 const idRange = q('SELECT MIN("id") AS lo, MAX("id") AS hi FROM "Subject"');
 const tagIdRange = q('SELECT MIN("id") AS lo, MAX("id") AS hi FROM "Tag"');
@@ -410,7 +420,6 @@ console.log(L);
 console.log(`subjects      ${fmt(counts.subjects)}`);
 console.log(`tags          ${fmt(counts.tags)}`);
 console.log(`subjectTags   ${fmt(counts.subjectTags)}`);
-console.log(`summary 非空   ${fmt(dbSummary.filled)}  (dump 同口径 ${fmt(scan.summaryFilled)} ${ok(dbSummary.filled, scan.summaryFilled)}) / 为 null ${fmt(dbSummaryNull)}`);
 console.log(`跳过行数       ${fmt(skipped)}  (JSON 解析失败 ${scan.parseErrors} / 结构非法 ${scan.invalid} / 重复 id ${scan.dupIds})`);
 console.log(`耗时          ${secs(totalMs)} s`);
 console.log(`dev.db 体积    ${mb(dbSize)} MB  (${DB_PATH})`);
@@ -456,9 +465,6 @@ const report = `# 数据导入报告（S2 · data-engineer）
 | Tag 去重数（nameLower） | ${fmt(counts.tags)} | ${fmt(BASELINE.tagLower)} | ${ok(counts.tags, BASELINE.tagLower)} |
 | SubjectTag 总数 | ${fmt(counts.subjectTags)} | ${fmt(BASELINE.subjectTags)}（推导值） | ${ok(counts.subjectTags, BASELINE.subjectTags)} |
 | 跳过行数 | ${fmt(skipped)} | 0 | ${skipped === 0 ? "✅" : "⚠️"} |
-| summary 非空 / 为 NULL | ${fmt(dbSummary.filled)} / ${fmt(dbSummaryNull)} | ${fmt(scan.summaryFilled)}（dump 非空） | ${ok(dbSummary.filled, scan.summaryFilled)} |
-
-> **体积口径变化（summary 入库）**：本次 \`Subject.summary\` 全量入库且**不截断**——非空 ${fmt(dbSummary.filled)} 条、原文 ${mb(dbSummary.bytes)} MB（UTF-8 均值 ${(dbSummary.bytes / dbSummary.filled).toFixed(0)} B，最长 ${fmt(dbSummary.maxChars)} 字符，id=${scan.summaryMaxId}），dev.db 因此较加列前明显增大；§1 的「≤ 600 MB」目标是 summary 入库前设定的阈值，现口径下不再适用，**不代表导入异常**（三表计数与基线仍逐项一致）。
 
 > **关联数口径说明（重要）**：本文的「SubjectTag 总数」= Σ 每条目 \`tags ∪ meta_tags\` 按 \`nameLower\` 去重后的集合大小，即 ${fmt(counts.subjectTags)} 行——**不是** \`tags[]\` 与 \`meta_tags[]\` 的原始条目之和。推导：\`tags[]\` 原始 ${fmt(scan.rawTagEntries)} 条 + \`meta_tags[]\` 原始 ${fmt(scan.rawMetaEntries)} 条 = ${fmt(scan.rawTagEntries + scan.rawMetaEntries)}，减去条目内 \`tags\` 自身重复 ${fmt(scan.dupInTags)} 条、\`meta_tags\` 与 \`tags\` 重复 ${fmt(scan.dupAcross)} 条 → **${fmt(counts.subjectTags)}**；该值与独立扫描 dump 的结果、\`COUNT(*) FROM "SubjectTag"\`、\`SUM(Tag.count)\` 三方一致。原 \`requirements.md\` / \`architecture.md\` / \`team-plan.md\` 中「>4,000,000 / 约 500 万」是按「每条目约 10 个标签」估算的，与 dump 实际分布不符（\`tags\` 数组长度 0–11、均值 ${(scan.rawTagEntries / scan.lines).toFixed(2)}，且大量条目标签很少），**该预估有误，以实测 ${fmt(counts.subjectTags)} 为准**。
 
@@ -498,8 +504,6 @@ ${phaseRows}
 | nsfw = true | ${fmt(dbNsfw)} |
 | rank 非空 | ${fmt(dbRank)} |
 | year 为 null | ${fmt(dbYearNull)} |
-| summary 非空 / 为 NULL | ${fmt(dbSummary.filled)} / ${fmt(dbSummaryNull)} |
-| summary 原文体积（UTF-8）/ 字符数 / 最长 | ${mb(dbSummary.bytes)} MB / ${fmt(scan.summaryChars)} / ${fmt(dbSummary.maxChars)} 字符 |
 
 ## 4. 与基线逐项核对
 
@@ -542,7 +546,7 @@ ${spotRows}
   1. 第一遍：统计每个 \`nameLower\` 的条目数（条目内 tags ∪ meta_tags 先去重）与每种原始写法的出现条目数；同时统计类型分布、score/date/rank 等。
   2. 写 Tag（规范名 + count），再第二遍写 Subject 与 SubjectTag。
 - **规范名**：同一 \`nameLower\` 取出现条目数最多的原始写法，并列取字典序最小（JS 字符串比较 = UTF-16 码元序）；\`Tag.count\` = 含该标签的条目数。
-- **字段映射**：\`year = /^(\\d{4})/\`；\`scoreVotes = Σ score_details\`；\`rank = rank > 0 ? rank : null\`；\`tagsJson\` 原顺序取前 10 个 \`{name,count}\`；\`metaTagsJson\` 原样；\`summary\` 原样入库（仅「非空字符串」保留，空串/缺失 → \`NULL\`，**不截断**，最长 ${fmt(scan.summaryMaxLen)} 字符，id=${scan.summaryMaxId}）。
+- **字段映射**：\`year = /^(\\d{4})/\`；\`scoreVotes = Σ score_details\`；\`rank = rank > 0 ? rank : null\`；\`tagsJson\` 原顺序取前 10 个 \`{name,count}\`；\`metaTagsJson\` 原样。
 - **日期归一**：dump 中 53,871 条日期为空字符串 \`""\`（无 \`null\`），入库统一规范为 \`NULL\`，因此 \`date IS NULL = 53,871\`、\`year IS NULL = 53,871\`；前端展示逻辑不受影响。
 - **幂等**：每次运行先 \`DELETE FROM "SubjectTag"/"Tag"/"Subject"\`，并重置 \`sqlite_sequence\` 中 Tag 的序列，重复导入计数与 Tag.id 均稳定；表/索引结构完全由 \`prisma db push\` 决定，脚本无任何 DDL。
 - **风险**：\`VACUUM\` 需≈DB 体积的临时磁盘；\`ANALYZE\` 在 470 万行库上约十几秒，属预期成本。

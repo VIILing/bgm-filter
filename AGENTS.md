@@ -23,7 +23,7 @@
 | --- | --- | --- |
 | Node | **≥ 22.5**（推荐 22.13+ / 24 LTS） | v27.0.0-alpha（可运行） |
 | pnpm | **12.x**（`allowBuilds` 语义） | 12.16.1 |
-| 磁盘 | ≥ 4 GB 空闲（dump 1.9 GB + DB 740 MB + node_modules ~700 MB） | 41 GB 可用 |
+| 磁盘 | ≥ 4 GB 空闲（dump 1.9 GB + DB 约 0.4 GB + node_modules ~700 MB） | 41 GB 可用 |
 | 网络 | 安装依赖、首次下载 dump、取封面时需要 | 已通 |
 
 ### 2.2 启动步骤（全新机器）
@@ -37,20 +37,22 @@ pnpm install
 pnpm db:generate
 pnpm db:push
 
-# 2) 准备 dump（约 449 MB zip → 解压约 1.9 GB）
-#    下载地址见 docs/db-download-url.txt（或 https://github.com/bangumi/Archive/releases/tag/archive）
-mkdir -p dump-db && cd dump-db
-curl -L -o dump.zip "https://github.com/bangumi/Archive/releases/download/archive/dump-2026-10-27.210404Z.zip"
-unzip -o dump.zip && cd ..
-# 至少需要 dump-db/subject.jsonlines（993 MB，700,108 行）
+# 2) 准备 dump（任选其一；至少需要 subject.jsonlines，993 MB / 700,108 行）
+#    方式 A（推荐，不下载不复制）：直读共享目录
+#      echo 'DUMP_DIR="/mnt/hgfs/bgm-filter/dump-db"' >> .env.local
+#    方式 B（本地下载，约 449 MB zip → 解压约 1.9 GB）
+#      下载地址见 docs/db-download-url.txt（或 https://github.com/bangumi/Archive/releases/tag/archive）
+#      mkdir -p dump-db && cd dump-db
+#      curl -L -o dump.zip "https://github.com/bangumi/Archive/releases/download/archive/dump-2026-10-27.210404Z.zip"
+#      unzip -o dump.zip && cd ..
 
-# 3) 导入（约 27–31 s，生成 prisma/dev.db）
+# 3) 导入（约 27–31 s，生成 prisma/dev.db；summary 不再入库）
 pnpm db:import
 
 # 4) 启动
-pnpm dev                      # http://localhost:3000
+pnpm dev                      # http://localhost:8004
 # 需要局域网/远程访问时：
-pnpm exec next dev -H 0.0.0.0 -p 7737
+pnpm exec next dev -H 0.0.0.0 -p 9004
 ```
 
 ### 2.3 环境变量
@@ -59,7 +61,7 @@ pnpm exec next dev -H 0.0.0.0 -p 7737
 | --- | --- | --- |
 | `DATABASE_URL` | `.env`（已提交） | `file:./dev.db`，相对 `prisma/` |
 | `BGM_API_TOKEN` | `.env.local`（**绝不提交**） | Bangumi 个人令牌；不配则 NSFW 条目封面 404 |
-| `DUMP_DIR` | 环境变量（可选） | 覆盖 dump 目录，默认 `dump-db` |
+| `DUMP_DIR` | `.env.local`（推荐）或环境变量 | 覆盖 dump 目录：绝对路径直接生效、相对路径相对仓库根、默认 `dump-db`；`.env.local` 优先 |
 
 模板见 `.env.template`。改完 `.env.local` **必须重启 dev** 才生效。
 
@@ -70,7 +72,7 @@ pnpm exec next dev -H 0.0.0.0 -p 7737
 
 ## 3. 关键约束（违反会出事故）
 
-1. **`dump-db/`、`prisma/*.db`、`.cache/`、`.env.local` 绝不入库**（`.gitignore` 已覆盖）。DB 当前 740 MB，dump 1.9 GB。
+1. **`dump-db/`、`prisma/*.db`、`.cache/`、`.env.local` 绝不入库**（`.gitignore` 已覆盖）。dump 约 1.9 GB（summary 不再入库，DB 体积显著回落）。
 2. **封面字段不能加到 `Subject` 表**：`scripts/import-dump.mjs` 每次导入会 `DELETE FROM "Subject"`，封面 URL 存在独立的 `.cache/covers.db`。
 3. **所有 Bangumi 请求必须走 `src/server/bgm/bgm-client.ts`**，不要在业务代码里直接 `fetch`、读 token、拼 `Authorization` 或各建限速器。
 4. **token 不得出现在客户端**：不要放在 `NEXT_PUBLIC_*`、不要 `console.log`、不要写进报告/截图/提交信息。
@@ -110,7 +112,7 @@ docs/                       # 需求、架构、UI 设计、数据报告、QA �
 ## 5. 数据模型与导入
 
 ```prisma
-Subject(id, type, name, nameCn, summary, date, year, score, scoreVotes, rank,
+Subject(id, type, name, nameCn, date, year, score, scoreVotes, rank,
         nsfw, favoriteJson, tagsJson, metaTagsJson)
 Tag(id, name, nameLower @unique, count)
 SubjectTag(subjectId, tagId)   // 复合主键 + @@index([tagId, subjectId])
@@ -118,7 +120,7 @@ SubjectTag(subjectId, tagId)   // 复合主键 + @@index([tagId, subjectId])
 
 - 类型：1 漫画 / 2 动画 / 3 音乐 / 4 游戏 / 6 三次元。
 - `tagsJson`：`[{"name":"井上雄彦","count":575}, …]`（count = 该标签在该条目上的使用人数）；`metaTagsJson`：`string[]`（无计数）。
-- `summary`：dump 原文，不截断（最长 15,130 字）。
+- 简介（summary）**不再入库**：随封面 API（`GET /v0/subjects/{id}`）懒加载，与封面 URL 一起缓存到 `.cache/covers.db` 的 `summary` 列。
 - `score = 0` 表示无评分；`year` 取 `date` 前 4 位数字（`0701` 会变 701，属预期脏数据）。
 
 **导入规则**：两遍扫描（第一遍统计标签写法与条目数，第二遍写入）、每 2000 条一事务、`WAL + synchronous=OFF + foreign_keys=OFF`、结束 `ANALYZE`。幂等：导入前清空三表。当前基线：
@@ -126,9 +128,8 @@ SubjectTag(subjectId, tagId)   // 复合主键 + @@index([tagId, subjectId])
 | 项 | 值 |
 | --- | --- |
 | Subject / Tag / SubjectTag | 700,108 / 91,909 / 2,267,357 |
-| summary 非空 | 575,804 |
 | 有评分 / 无日期 | 287,448 / 53,871 |
-| 导入耗时 / DB 体积 | 约 27–31 s / 740 MB |
+| 导入耗时 / DB 体积 | 约 27–31 s（summary 不再入库，体积回落） |
 
 > `docs/requirements.md` 早期预估「约 500 万标签关联」有误，实测 2,267,357；详见 `docs/data-report.md`。
 
@@ -151,7 +152,7 @@ C = Σ(score*votes)/Σ(votes)（动态查询，约 7.104），m = 50
 
 ### 6.3 封面
 - URL 含随机 hash，必须逐条调 `GET /v0/subjects/{id}`；无批量接口，官方限流 3000 次/10min/IP，超限封 1 小时。
-- 只缓存 URL 到 `.cache/covers.db`（`id, grid, small, common, fetchedAt, missing, reason`，`PRAGMA user_version=3`）；正缓存永久，`not_found` 1 天、`no_image` 7 天。
+- 只缓存 URL 与简介到 `.cache/covers.db`（`id, grid, small, common, summary, summaryFetched, fetchedAt, missing, reason`，`PRAGMA user_version=4`）；正缓存永久，`not_found` 1 天、`no_image` 7 天。
 - 前端每 10 个一块、链式请求（`CoverLoader`），文字先渲染，封面渐进填充；冷启动首图约 2.8 s、整页约 12 s，暖缓存 <1.2 s。
 - NSFW 门禁已移除，但**匿名 API 对 NSFW 返回 404**；配 `BGM_API_TOKEN` 后可正常取图。
 
@@ -159,7 +160,7 @@ C = Σ(score*votes)/Σ(votes)（动态查询，约 7.104），m = 50
 `src/server/bgm/bgm-client.ts` 是唯一出口：UA、Bearer token（`BGM_API_TOKEN`，构造时快照）、5 s 超时、令牌桶 4 req/s + 突发 4、并发 5、瞬时错误重试 1 次（300–600 ms jitter）、熔断 10 次/30 s 半开。错误：`BgmHttpError` / `BgmNetworkError` / `BgmCircuitOpenError`；`getSubject(id)` 404 → `null`。
 
 ### 6.5 悬浮预览
-`subject.preview({id})` 返回 `{summary, tags:[{name,count}], metaTags}`；`HoverPreview` 用 Portal + fixed 面板（宽 `min(640,48vw)`、高 `100vh-80`、`top=64`、右缘对齐内容列），面板根部原生 `wheel` 监听（`passive:false`）吞掉页面滚动，只滚内部 `[data-preview-scroll]` 容器。
+`subject.preview({id})` 返回 `{tags:[{name,count}], metaTags}`（本地 DB）；`subject.summary({id})` 返回 `{summary}`（懒加载，与封面同源缓存，永不抛错）；`HoverPreview` 用 Portal + fixed 面板（宽 `min(640,48vw)`、高 `100vh-80`、`top=64`、右缘对齐内容列），面板根部原生 `wheel` 监听（`passive:false`）吞掉页面滚动，只滚内部 `[data-preview-scroll]` 容器。
 
 ### 6.6 URL 状态
 `tag / q / types / from / to / sort / scoreless / page`；默认值省略；`types` 逗号分隔；非法值回退默认。筛选变化 300 ms debounce 后 `router.replace(..., {scroll:false})` 并重置 `page=1`。
@@ -170,8 +171,8 @@ C = Σ(score*votes)/Σ(votes)（动态查询，约 7.104），m = 50
 
 | 命令 | 说明 |
 | --- | --- |
-| `pnpm dev` | 开发服务器（3000） |
-| `pnpm exec next dev -H 0.0.0.0 -p 7737` | 对外访问（本项目当前使用） |
+| `pnpm dev` | 开发服务器（8004） |
+| `pnpm exec next dev -H 0.0.0.0 -p 9004` | 对外访问（本项目当前使用） |
 | `pnpm build` / `pnpm start` | 生产构建 / 启动 |
 | `pnpm typecheck` | `tsc --noEmit` |
 | `pnpm test` | Vitest（单元 + 真实数据集成，共 171 项） |
@@ -196,7 +197,7 @@ C = Σ(score*votes)/Σ(votes)（动态查询，约 7.104），m = 50
 手工验收：`docs/qa-report.md` 有历史逐条证据；API 可直接 GET：
 ```bash
 curl --get --data-urlencode 'input={"json":{"tagExpr":"科幻 & 百合","page":1}}' \
-  http://127.0.0.1:7737/api/trpc/subject.search
+  http://127.0.0.1:9004/api/trpc/subject.search
 ```
 
 ---
@@ -226,9 +227,10 @@ curl --get --data-urlencode 'input={"json":{"tagExpr":"科幻 & 百合","page":1
 | 页面白屏 / 500，日志提示表不存在 | `prisma/dev.db` 未导入：`pnpm db:import`。 |
 | 封面全都没有 | 未联网 / token 失效 / 缓存负命中；看 `.cache/covers.db` 的 `reason`，必要时删负缓存行或整个文件。 |
 | NSFW 封面 404 | 未配 `BGM_API_TOKEN` 或令牌无权限；配好后重启，等 1 天负缓存过期或删缓存。 |
-| 端口占用 | `ss -ltnp \| grep 3000`，结束旧进程；或用 `-p 7737`。 |
+| 端口占用 | `ss -ltnp \| grep 8004`，结束旧进程；对外用 `-p 9004`。 |
 | dev 进程 EPIPE 刷屏 | 终端/管道断开导致；直接结束进程重启（不要用 inspector 改 stdout）。 |
 | `pnpm install` 报 ERR_PNPM_IGNORED_BUILDS | 检查 `pnpm-workspace.yaml` 的 `allowBuilds` 是否包含 prisma/esbuild/sharp 等。 |
+| `pnpm install` 报 ERR_PNPM_STORE_DIR_OPEN_OPERATION_LOCK | 沙箱拒绝写 `XDG_RUNTIME_DIR`：`mkdir -p .runtime .tmp && chmod 700 .runtime` 后 `XDG_RUNTIME_DIR=$PWD/.runtime TMPDIR=$PWD/.tmp pnpm install`。`.npmrc` 的 store-dir/cache-dir 在 pnpm 12 为 no-op。 |
 | 导入超时/中断 | 脚本幂等，直接重跑；确认磁盘 ≥4 GB、dump 文件完整。 |
 
 ---
@@ -249,7 +251,7 @@ curl --get --data-urlencode 'input={"json":{"tagExpr":"科幻 & 百合","page":1
 ## 12. 交接自检清单
 
 - [ ] `pnpm install && pnpm db:generate && pnpm db:push` 成功
-- [ ] `dump-db/subject.jsonlines` 存在且约 700,108 行
+- [ ] dump 可用（共享目录经 `DUMP_DIR` 指向，或本地 `dump-db/subject.jsonlines`，约 700,108 行）
 - [ ] `pnpm db:import` 成功，`Subject` = 700,108、`SubjectTag` = 2,267,357
 - [ ] `pnpm test` 全绿、`pnpm typecheck` 0 error
 - [ ] `pnpm dev` 打开首页：默认「综合评分」、50 条、封面可见

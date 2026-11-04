@@ -89,10 +89,36 @@ function computePlacement(viewportWidth: number, viewportHeight: number): PanelP
  * 容器；容器已到边界或没有容器时滚轮被吞掉，页面/列表绝不滚动。
  * 面板自身阻止 click / mousedown 冒泡，因此点面板不会跳转 bgm.tv。
  */
+
+/** 简介区骨架：文字提示 + 几行灰条，简介到达后渐进替换。 */
+function SummarySkeleton() {
+  return (
+    <div className="space-y-2" aria-busy="true">
+      <p className="text-slate-400">正在加载简介…</p>
+      <div className="h-3 w-full animate-pulse rounded bg-slate-100" />
+      <div className="h-3 w-5/6 animate-pulse rounded bg-slate-100" />
+      <div className="h-3 w-4/6 animate-pulse rounded bg-slate-100" />
+      <div className="h-3 w-2/3 animate-pulse rounded bg-slate-100" />
+    </div>
+  );
+}
+
+/** 标签区骨架：若干灰色 chip，标签数据（本地 DB）到达后替换。 */
+function TagSkeleton() {
+  return (
+    <div className="flex flex-wrap gap-1" aria-busy="true">
+      {[0, 1, 2, 3, 4].map((index) => (
+        <div key={index} className="h-5 w-16 animate-pulse rounded bg-slate-100" />
+      ))}
+    </div>
+  );
+}
+
 export function HoverPreview({ subject, onKeepAlive, onRequestClose }: HoverPreviewProps) {
   const panelRef = useRef<HTMLDivElement>(null);
 
-  // 组件只在 hover 打开后挂载，等价于 `enabled: open`；缓存 5 分钟避免快速划过时重复请求。
+  // 标签 / 公共标签：本地 DB，毫秒级；组件只在 hover 打开后挂载，等价于 `enabled: open`。
+  // 缓存 5 分钟避免快速划过时重复请求。
   const previewQuery = trpc.subject.preview.useQuery(
     { id: subject.id },
     {
@@ -100,6 +126,18 @@ export function HoverPreview({ subject, onKeepAlive, onRequestClose }: HoverPrev
       staleTime: 5 * 60 * 1000,
       refetchOnWindowFocus: false,
       retry: 1,
+    },
+  );
+
+  // 简介：与封面同源懒加载（外部 API + cover_cache），冷缓存较慢，独立骨架渐进填充。
+  // 接口永不抛错（404/网络/熔断/空 → summary:null），失败与空统一「暂无简介」，故不重试。
+  const summaryQuery = trpc.subject.summary.useQuery(
+    { id: subject.id },
+    {
+      enabled: true,
+      staleTime: 5 * 60 * 1000,
+      refetchOnWindowFocus: false,
+      retry: false,
     },
   );
 
@@ -154,7 +192,7 @@ export function HoverPreview({ subject, onKeepAlive, onRequestClose }: HoverPrev
   const preview = previewQuery.data;
   const tags = preview?.tags ?? [];
   const metaTags = preview?.metaTags ?? [];
-  const summary = preview?.summary ?? null;
+  const summary = summaryQuery.data?.summary ?? null;
 
   return createPortal(
     <div
@@ -188,10 +226,8 @@ export function HoverPreview({ subject, onKeepAlive, onRequestClose }: HoverPrev
         data-preview-scroll=""
         className="min-h-0 flex-1 overflow-y-auto whitespace-pre-wrap px-4 py-3 text-[13px] leading-relaxed text-slate-600"
       >
-        {previewQuery.isError ? (
-          <p className="text-slate-500">预览加载失败</p>
-        ) : previewQuery.isPending ? (
-          <p className="text-slate-400">加载中…</p>
+        {summaryQuery.isPending ? (
+          <SummarySkeleton />
         ) : summary ? (
           summary
         ) : (
@@ -201,9 +237,16 @@ export function HoverPreview({ subject, onKeepAlive, onRequestClose }: HoverPrev
 
       <div className="shrink-0 border-t border-slate-100 px-4 py-3">
         <p className="mb-1.5 text-xs font-medium text-slate-700">
-          标签 <span className="tabular-nums text-slate-500">{tags.length}</span>
+          标签{" "}
+          <span className="tabular-nums text-slate-500">
+            {previewQuery.isPending ? "…" : tags.length}
+          </span>
         </p>
-        {tags.length === 0 ? (
+        {previewQuery.isPending ? (
+          <TagSkeleton />
+        ) : previewQuery.isError ? (
+          <p className="text-xs text-slate-400">标签加载失败</p>
+        ) : tags.length === 0 ? (
           <p className="text-xs text-slate-400">暂无标签</p>
         ) : (
           <div
