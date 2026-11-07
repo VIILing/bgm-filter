@@ -1,7 +1,7 @@
 /**
  * 封面 URL + 简介解析服务。
  *
- * 产品决策：只解析并缓存「id → {grid,small,common} URL」与「id → summary 简介」，
+ * 产品决策：只解析并缓存「id → {grid,small,common,large} URL」与「id → summary 简介」，
  * 图片字节一律不落盘、不经服务端代理，由浏览器直连 `lain.bgm.tv`。本模块只有
  * 字符串级缓存，且**永不向前端抛错**：任何外部/缓存异常都降级为 `null`。
  *
@@ -29,6 +29,7 @@ import {
 import {
   CoverCache,
   DEFAULT_COVER_CACHE_PATH,
+  deriveLargeUrl,
   type CoverCacheWrite,
 } from "./cover-cache";
 
@@ -92,10 +93,12 @@ const realClock: CoverClock = {
 };
 
 /**
- * 纯函数：把官方 `images` 对象转成契约里的三尺寸 URL。
+ * 纯函数：把官方 `images`（或缓存行）转成契约里的四尺寸 URL。
  *
  * 容错空字符串 / null / 非字符串 / 缺字段：任一尺寸缺失时用其它可用尺寸顶替
  * （grid → small → common；common → small → grid），全空返回 null。
+ * `large` 优先取官方值；缺失时从 common（其次 small/grid）安全推导，
+ * 推导失败保持 null（前端回退到较小尺寸）。
  */
 export function pickCoverUrls(images: unknown): CoverUrls | null {
   if (images === null || typeof images !== "object") return null;
@@ -109,6 +112,7 @@ export function pickCoverUrls(images: unknown): CoverUrls | null {
     grid: grid ?? small ?? common!,
     small: small ?? common ?? grid!,
     common: common ?? small ?? grid!,
+    large: readUrl(record.large) ?? deriveLargeUrl(common ?? small ?? grid),
   };
 }
 
@@ -227,6 +231,9 @@ class CoverServiceEngine implements CoverService {
           this.negativeTtlMs,
           this.notFoundTtlMs,
         )) {
+          // 正缓存但 large 为空（v4 旧行的 common 无法安全推导）：不视为最终命中，
+          // 走一次正常回源补齐原图；负缓存（missing）语义完全不变。
+          if (!entry.missing && entry.large === null) continue;
           resolved.set(id, entry.missing ? null : pickCoverUrls(entry));
         }
       } catch (error) {
@@ -279,7 +286,11 @@ class CoverServiceEngine implements CoverService {
         const entry = cache
           .getMany([id], now, this.negativeTtlMs, this.notFoundTtlMs)
           .get(id);
-        if (entry && entry.summaryFetched) return entry.summary;
+        // 正缓存行若缺 large（v4 旧行无法推导），顺带回源一次补齐原图；
+        // 负缓存行（missing）保持原语义，直接返回已定论的 summary。
+        if (entry && entry.summaryFetched && (entry.missing || entry.large !== null)) {
+          return entry.summary;
+        }
       } catch (error) {
         this.warn("[cover] 读取简介缓存失败，继续回源", error);
       }

@@ -1,8 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { HoverPreview } from "~/components/HoverPreview";
+import { SubjectDialog } from "~/components/SubjectDialog";
 import { SubjectCard } from "~/components/SubjectCard";
 import type { CoverUrls, SubjectCardDto } from "~/shared/subject-contract";
 
@@ -13,31 +13,35 @@ export interface ResultListProps {
   onTagClick: (tag: string) => void;
 }
 
-interface HoveredRow {
-  id: number;
+/** <768 不启用弹窗，点击行沿用原始 target=_blank 跳转。 */
+const DIALOG_MIN_WIDTH = 768;
+/** 关闭动画 140ms；多留 10ms 让动画播完再卸载。 */
+const CLOSE_ANIMATION_MS = 150;
+
+interface OpenDialog {
+  subject: SubjectCardDto;
+  trigger: HTMLElement;
 }
 
-/** 行 hover 后延迟打开：快速划过不逐个发请求。 */
-const OPEN_DELAY_MS = 150;
-/** 离开行 / 面板后的延迟关闭，给指针移动到面板留出时间。 */
-const CLOSE_DELAY_MS = 120;
-/** 窄屏不展示预览，避免遮挡内容。 */
-const PREVIEW_MIN_WIDTH = 768;
-
-/** 仅桌面指针设备（`hover: hover`）且宽度 ≥768px 时启用悬浮预览。 */
-function useHoverPreviewEnabled(): boolean {
+/** ≥768 且鼠标设备（hover:hover / pointer:fine）才启用点击弹窗。 */
+function useDialogEnabled(): boolean {
   const [enabled, setEnabled] = useState(false);
 
   useEffect(() => {
     const hoverQuery = window.matchMedia("(hover: hover)");
+    const finePointerQuery = window.matchMedia("(pointer: fine)");
     const update = () => {
-      setEnabled(hoverQuery.matches && window.innerWidth >= PREVIEW_MIN_WIDTH);
+      setEnabled(
+        hoverQuery.matches && finePointerQuery.matches && window.innerWidth >= DIALOG_MIN_WIDTH,
+      );
     };
     update();
     hoverQuery.addEventListener("change", update);
+    finePointerQuery.addEventListener("change", update);
     window.addEventListener("resize", update);
     return () => {
       hoverQuery.removeEventListener("change", update);
+      finePointerQuery.removeEventListener("change", update);
       window.removeEventListener("resize", update);
     };
   }, []);
@@ -45,24 +49,34 @@ function useHoverPreviewEnabled(): boolean {
   return enabled;
 }
 
+function prefersReducedMotion(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches
+  );
+}
+
 /**
- * 结果列表：行卡片 + 至多一个悬浮预览。
+ * 结果列表：行卡片 + 至多一个点击弹窗。
  *
- * 预览状态集中在这里（同一时刻只显示一个），打开/关闭都走 150ms/120ms 计时；
- * 指针进入面板时 `keepAlive` 取消关闭，离开面板再重新计时。
+ * - 悬浮只保留行高亮，不发 preview/summary/原图请求；
+ * - 点击整卡（标签 chip 除外）打开唯一弹窗；<768 / 触屏不拦截，保留 target=_blank；
+ * - 关闭动画 150ms 后再卸载；关闭后焦点回触发行（行已移除则回结果列表）。
  */
 export function ResultList({ items, covers, onTagClick }: ResultListProps) {
-  const previewEnabled = useHoverPreviewEnabled();
-  const [hovered, setHovered] = useState<HoveredRow | null>(null);
-  const openTimerRef = useRef<number | null>(null);
+  const dialogEnabled = useDialogEnabled();
+  const [dialog, setDialog] = useState<OpenDialog | null>(null);
+  const [closing, setClosing] = useState(false);
+  const listRef = useRef<HTMLUListElement>(null);
+  const dialogRef = useRef<OpenDialog | null>(null);
+  const closingRef = useRef(false);
   const closeTimerRef = useRef<number | null>(null);
+  const lastTriggerRef = useRef<HTMLElement | null>(null);
+  // 只在「结果集真的换了」时关闭；窗口重新聚焦触发的同结果 refetch 不应关弹窗。
+  const itemsKey = useMemo(() => items.map((item) => item.id).join(","), [items]);
+  const itemsKeyRef = useRef(itemsKey);
 
-  const clearOpenTimer = useCallback(() => {
-    if (openTimerRef.current !== null) {
-      window.clearTimeout(openTimerRef.current);
-      openTimerRef.current = null;
-    }
-  }, []);
+  dialogRef.current = dialog;
 
   const clearCloseTimer = useCallback(() => {
     if (closeTimerRef.current !== null) {
@@ -71,104 +85,102 @@ export function ResultList({ items, covers, onTagClick }: ResultListProps) {
     }
   }, []);
 
-  const scheduleOpen = useCallback(
-    (id: number) => {
-      clearOpenTimer();
-      clearCloseTimer();
-      openTimerRef.current = window.setTimeout(() => {
-        openTimerRef.current = null;
-        setHovered({ id });
-      }, OPEN_DELAY_MS);
-    },
-    [clearCloseTimer, clearOpenTimer],
-  );
-
-  const scheduleClose = useCallback(() => {
-    clearOpenTimer();
+  const openDialog = useCallback((subject: SubjectCardDto, trigger: HTMLElement) => {
     clearCloseTimer();
+    closingRef.current = false;
+    setClosing(false);
+    setDialog({ subject, trigger });
+  }, [clearCloseTimer]);
+
+  const closeDialog = useCallback(() => {
+    if (!dialogRef.current || closingRef.current) return;
+    closingRef.current = true;
+    setClosing(true);
+    const delay = prefersReducedMotion() ? 0 : CLOSE_ANIMATION_MS;
     closeTimerRef.current = window.setTimeout(() => {
       closeTimerRef.current = null;
-      setHovered(null);
-    }, CLOSE_DELAY_MS);
-  }, [clearCloseTimer, clearOpenTimer]);
-
-  const keepAlive = useCallback(() => {
-    clearCloseTimer();
-    clearOpenTimer();
-  }, [clearCloseTimer, clearOpenTimer]);
-
-  // 筛选 / 翻页换了一批结果：立即收起旧预览，避免面板内容与行错位。
-  useEffect(() => {
-    setHovered(null);
-  }, [items]);
-
-  // 切到窄屏或触屏（media query / resize 变化）时停用。
-  useEffect(() => {
-    if (previewEnabled) return;
-    clearOpenTimer();
-    clearCloseTimer();
-    setHovered(null);
-  }, [previewEnabled, clearCloseTimer, clearOpenTimer]);
-
-  // 卸载时清掉计时器，避免对已卸载组件 setState。
-  useEffect(
-    () => () => {
-      clearOpenTimer();
-      clearCloseTimer();
-    },
-    [clearCloseTimer, clearOpenTimer],
-  );
-
-  // 页面滚动 / resize 时面板位置可能失效：取消「还没打开」的计时；
-  // 已打开的面板由 HoverPreview 自己监听 scroll/resize 关闭（并忽略面板内部滚动）。
-  useEffect(() => {
-    const cancelPendingOpen = () => {
-      if (openTimerRef.current !== null) {
-        window.clearTimeout(openTimerRef.current);
-        openTimerRef.current = null;
-      }
-    };
-    const handleScroll = (event: Event) => {
-      const panel = document.querySelector("[data-hover-preview]");
-      if (panel && event.target instanceof Node && panel.contains(event.target)) return;
-      cancelPendingOpen();
-    };
-    window.addEventListener("scroll", handleScroll, true);
-    window.addEventListener("resize", cancelPendingOpen);
-    return () => {
-      window.removeEventListener("scroll", handleScroll, true);
-      window.removeEventListener("resize", cancelPendingOpen);
-    };
+      closingRef.current = false;
+      setDialog(null);
+      setClosing(false);
+    }, delay);
   }, []);
 
-  const hoveredSubject = hovered ? items.find((item) => item.id === hovered.id) : undefined;
+  // 筛选 / 翻页 / 结果集变化：关闭弹窗（内容与行已不对应）。
+  useEffect(() => {
+    if (itemsKeyRef.current === itemsKey) return;
+    itemsKeyRef.current = itemsKey;
+    closeDialog();
+  }, [itemsKey, closeDialog]);
+
+  // 缩到 <768 或切到触屏：关闭弹窗。
+  useEffect(() => {
+    if (dialogEnabled) return;
+    closeDialog();
+  }, [dialogEnabled, closeDialog]);
+
+  // 关闭动画结束、弹窗卸载后再还原焦点（此时背景已解除 inert）。
+  useEffect(() => {
+    if (dialog !== null) return;
+    const trigger = lastTriggerRef.current;
+    if (!trigger) return;
+    lastTriggerRef.current = null;
+    if (trigger.isConnected) trigger.focus({ preventScroll: true });
+    else listRef.current?.focus({ preventScroll: true });
+  }, [dialog]);
+
+  // 卸载时清掉关闭计时器，避免对已卸载组件 setState。
+  useEffect(
+    () => () => {
+      clearCloseTimer();
+    },
+    [clearCloseTimer],
+  );
+
+  const handleOpen = useCallback(
+    (subject: SubjectCardDto) => (trigger: HTMLElement) => {
+      lastTriggerRef.current = trigger;
+      openDialog(subject, trigger);
+    },
+    [openDialog],
+  );
 
   return (
     <>
-      <ul className="divide-y divide-slate-100" aria-label="条目结果">
+      <ul
+        ref={listRef}
+        tabIndex={-1}
+        className="divide-y divide-slate-100 outline-none"
+        aria-label="条目结果"
+      >
         {items.map((subject) => (
           <SubjectCard
             key={subject.id}
             subject={subject}
             cover={covers[String(subject.id)] ?? null}
             onTagClick={onTagClick}
-            onHover={previewEnabled ? () => scheduleOpen(subject.id) : undefined}
-            onLeave={previewEnabled ? scheduleClose : undefined}
+            dialogEnabled={dialogEnabled}
+            onOpen={dialogEnabled ? handleOpen(subject) : undefined}
           />
         ))}
       </ul>
 
-      {previewEnabled && hovered && hoveredSubject && (
-        <HoverPreview
+      {dialog && (
+        <SubjectDialog
           subject={{
-            id: hoveredSubject.id,
-            name: hoveredSubject.name,
-            type: hoveredSubject.type,
-            year: hoveredSubject.year,
-            date: hoveredSubject.date,
+            id: dialog.subject.id,
+            name: dialog.subject.name,
+            nameCn: dialog.subject.nameCn,
+            type: dialog.subject.type,
+            year: dialog.subject.year,
+            date: dialog.subject.date,
+            score: dialog.subject.score,
+            scoreVotes: dialog.subject.scoreVotes,
+            rank: dialog.subject.rank,
           }}
-          onKeepAlive={keepAlive}
-          onRequestClose={scheduleClose}
+          // undefined = 该块封面尚未加载（弹窗按单 id 兜底查询）；null = 已确认无封面。
+          cover={covers[String(dialog.subject.id)]}
+          closing={closing}
+          onClose={closeDialog}
         />
       )}
     </>

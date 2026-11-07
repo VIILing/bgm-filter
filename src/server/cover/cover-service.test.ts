@@ -6,6 +6,10 @@
  * 缓存、分级 TTL、输入清洗、images 回退、失败不写缓存、单条失败隔离。
  */
 
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
@@ -50,6 +54,7 @@ function coverUrls(id: number): CoverUrls {
     grid: `https://lain.bgm.tv/r/100/pic/cover/l/aa/bb/${id}_grid.jpg`,
     small: `https://lain.bgm.tv/r/200/pic/cover/l/aa/bb/${id}_small.jpg`,
     common: `https://lain.bgm.tv/r/400/pic/cover/l/aa/bb/${id}_common.jpg`,
+    large: `https://lain.bgm.tv/pic/cover/l/aa/bb/${id}_large.jpg`,
   };
 }
 
@@ -87,6 +92,62 @@ function createFakeClient(
 }
 
 const services: CoverService[] = [];
+const tempDirs: string[] = [];
+
+function createTempDbPath(): string {
+  const dir = mkdtempSync(join(tmpdir(), "bgm-cover-service-"));
+  tempDirs.push(dir);
+  return join(dir, "covers.db");
+}
+
+interface V4SeedRow {
+  id: number;
+  grid: string | null;
+  small: string | null;
+  common: string | null;
+  summary?: string | null;
+  summaryFetched?: 0 | 1;
+  missing?: 0 | 1;
+  reason?: "ok" | "no_image" | "not_found" | "unknown";
+}
+
+/** 造一个真实 v4 缓存库（无 large 列），用于验证旧行升级路径。 */
+function seedV4Cache(path: string, rows: readonly V4SeedRow[]): void {
+  const db = new DatabaseSync(path);
+  db.exec(`
+    CREATE TABLE cover_cache (
+      id        INTEGER PRIMARY KEY,
+      grid      TEXT,
+      small     TEXT,
+      common    TEXT,
+      summary   TEXT,
+      summaryFetched INTEGER NOT NULL DEFAULT 0,
+      "fetchedAt" INTEGER NOT NULL,
+      missing   INTEGER NOT NULL DEFAULT 0,
+      reason    TEXT NOT NULL DEFAULT 'unknown'
+    )
+  `);
+  const statement = db.prepare(
+    `INSERT INTO cover_cache (id, grid, small, common, summary, summaryFetched, "fetchedAt", missing, reason)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  const fetchedAt = Date.now();
+  for (const row of rows) {
+    statement.run(
+      row.id,
+      row.grid,
+      row.small,
+      row.common,
+      row.summary ?? null,
+      row.summaryFetched ?? 1,
+      fetchedAt,
+      row.missing ?? 0,
+      row.reason ?? (row.missing ? "not_found" : "ok"),
+    );
+  }
+  db.exec("PRAGMA user_version = 4");
+  db.close();
+}
 
 function createTestService(options: CoverServiceOptions = {}): {
   service: CoverService;
@@ -105,15 +166,17 @@ function createTestService(options: CoverServiceOptions = {}): {
 
 afterEach(() => {
   for (const service of services.splice(0)) service.close();
+  for (const dir of tempDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 describe("pickCoverUrls", () => {
-  it("正常返回三个尺寸", () => {
-    const images = { ...coverUrls(1), large: "https://lain.bgm.tv/large.jpg" };
-    expect(pickCoverUrls(images)).toEqual(coverUrls(1));
+  it("正常返回四个尺寸", () => {
+    expect(pickCoverUrls(coverUrls(1))).toEqual(coverUrls(1));
   });
 
-  it("空字符串 / 全空视为无封面", () => {
+  it("空字符串 / 全空视为无封面（即使只有 large）", () => {
     expect(
       pickCoverUrls({ grid: "", small: "", common: "", large: "x" }),
     ).toBeNull();
@@ -126,11 +189,58 @@ describe("pickCoverUrls", () => {
     }
   });
 
-  it("缺 common 时用 small 顶替", () => {
-    expect(pickCoverUrls({ grid: "g", small: "s" })).toEqual({
+  it("官方 large 缺失时从 common 的 /r/400/ 推导原图", () => {
+    expect(
+      pickCoverUrls({
+        grid: "https://lain.bgm.tv/r/100/pic/cover/l/aa/bb/1_x.jpg",
+        small: "https://lain.bgm.tv/r/200/pic/cover/l/aa/bb/1_x.jpg",
+        common: "https://lain.bgm.tv/r/400/pic/cover/l/aa/bb/1_x.jpg",
+      }),
+    ).toEqual({
+      grid: "https://lain.bgm.tv/r/100/pic/cover/l/aa/bb/1_x.jpg",
+      small: "https://lain.bgm.tv/r/200/pic/cover/l/aa/bb/1_x.jpg",
+      common: "https://lain.bgm.tv/r/400/pic/cover/l/aa/bb/1_x.jpg",
+      large: "https://lain.bgm.tv/pic/cover/l/aa/bb/1_x.jpg",
+    });
+  });
+
+  it("官方 large 为空串/空白时同样从 common 推导", () => {
+    expect(
+      pickCoverUrls({
+        grid: "g",
+        small: "s",
+        common: "https://lain.bgm.tv/r/400/pic/cover/l/aa/bb/1_x.jpg",
+        large: "  ",
+      })?.large,
+    ).toBe("https://lain.bgm.tv/pic/cover/l/aa/bb/1_x.jpg");
+  });
+
+  it("common 不是可推导的缩放 URL 时 large 为 null", () => {
+    expect(
+      pickCoverUrls({
+        grid: "g",
+        small: "s",
+        common: "https://lain.bgm.tv/pic/cover/l/aa/bb/1_x.jpg",
+      }),
+    ).toEqual({
       grid: "g",
       small: "s",
-      common: "s",
+      common: "https://lain.bgm.tv/pic/cover/l/aa/bb/1_x.jpg",
+      large: null,
+    });
+  });
+
+  it("缺 common 时用 small 顶替，large 从 small 的 /r/200/ 推导", () => {
+    expect(
+      pickCoverUrls({
+        grid: "https://lain.bgm.tv/r/100/pic/cover/l/aa/bb/1_x.jpg",
+        small: "https://lain.bgm.tv/r/200/pic/cover/l/aa/bb/1_x.jpg",
+      }),
+    ).toEqual({
+      grid: "https://lain.bgm.tv/r/100/pic/cover/l/aa/bb/1_x.jpg",
+      small: "https://lain.bgm.tv/r/200/pic/cover/l/aa/bb/1_x.jpg",
+      common: "https://lain.bgm.tv/r/200/pic/cover/l/aa/bb/1_x.jpg",
+      large: "https://lain.bgm.tv/pic/cover/l/aa/bb/1_x.jpg",
     });
   });
 
@@ -139,21 +249,23 @@ describe("pickCoverUrls", () => {
       grid: "g",
       small: "c",
       common: "c",
+      large: null,
     });
   });
 
-  it("只有 grid 时三个尺寸都用 grid", () => {
+  it("只有 grid 时三个尺寸都用 grid，large 不可推导为 null", () => {
     expect(pickCoverUrls({ grid: "g" })).toEqual({
       grid: "g",
       small: "g",
       common: "g",
+      large: null,
     });
   });
 
   it("null / 空白 / 非字符串字段均视为缺失", () => {
     expect(
       pickCoverUrls({ grid: "  ", small: null, common: "c" }),
-    ).toEqual({ grid: "c", small: "c", common: "c" });
+    ).toEqual({ grid: "c", small: "c", common: "c", large: null });
   });
 });
 
@@ -324,6 +436,127 @@ describe("cover-service 缓存", () => {
       "2": null,
       "3": coverUrls(3),
     });
+  });
+
+  it("新抓取的条目把 large 一并写入缓存，重启后仍可命中（零回源）", async () => {
+    const path = createTempDbPath();
+    const first = createFakeClient((id) => subjectFor(id));
+    const service1 = createTestService({ client: first.client, cachePath: path });
+
+    expect(await service1.service.getCovers([31])).toEqual({
+      "31": coverUrls(31),
+    });
+    expect(first.calls).toEqual([31]);
+    service1.service.close();
+
+    const second = createFakeClient((id) => subjectFor(id));
+    const service2 = createTestService({ client: second.client, cachePath: path });
+    expect(await service2.service.getCovers([31])).toEqual({
+      "31": coverUrls(31),
+    });
+    expect(second.calls).toEqual([]);
+  });
+});
+
+describe("cover-service 旧缓存（v4）升级兼容", () => {
+  it("common 可推导：旧行零回源直接得到 large", async () => {
+    const path = createTempDbPath();
+    // 真实 API 的 5 种尺寸共用同一文件名，仅 /r/<宽度>/ 前缀不同。
+    const base = "https://lain.bgm.tv/pic/cover/l/aa/bb/5_x.jpg";
+    const urls = {
+      grid: "https://lain.bgm.tv/r/100/pic/cover/l/aa/bb/5_x.jpg",
+      small: "https://lain.bgm.tv/r/200/pic/cover/l/aa/bb/5_x.jpg",
+      common: "https://lain.bgm.tv/r/400/pic/cover/l/aa/bb/5_x.jpg",
+      large: base,
+    };
+    seedV4Cache(path, [
+      {
+        id: 5,
+        grid: urls.grid,
+        small: urls.small,
+        common: urls.common,
+        summary: "旧简介 5",
+        summaryFetched: 1,
+      },
+    ]);
+
+    const { client, calls } = createFakeClient((id) => subjectFor(id));
+    const { service } = createTestService({ client, cachePath: path });
+
+    expect(await service.getCovers([5])).toEqual({ "5": urls });
+    expect(calls).toEqual([]);
+  });
+
+  it("common 不可推导：本次回源一次补齐 large，之后正常命中", async () => {
+    const path = createTempDbPath();
+    const urls = coverUrls(51);
+    seedV4Cache(path, [
+      {
+        id: 51,
+        grid: urls.grid,
+        small: urls.small,
+        // 已是原图 / 非标准路径：无法安全推导，留给正常回源补齐。
+        common: urls.large,
+        summary: "旧简介 51",
+        summaryFetched: 1,
+      },
+    ]);
+
+    const { client, calls } = createFakeClient((id) => subjectFor(id));
+    const { service } = createTestService({ client, cachePath: path });
+
+    expect(await service.getCovers([51])).toEqual({ "51": urls });
+    expect(calls).toEqual([51]);
+
+    expect(await service.getCovers([51])).toEqual({ "51": urls });
+    expect(calls).toEqual([51]);
+  });
+
+  it("404 负缓存语义不变：缺 large 也不会回源", async () => {
+    const path = createTempDbPath();
+    seedV4Cache(path, [
+      {
+        id: 9,
+        grid: null,
+        small: null,
+        common: null,
+        summary: null,
+        summaryFetched: 1,
+        missing: 1,
+        reason: "not_found",
+      },
+    ]);
+
+    const { client, calls } = createFakeClient((id) => subjectFor(id));
+    const { service } = createTestService({ client, cachePath: path });
+
+    expect(await service.getCovers([9])).toEqual({ "9": null });
+    expect(await service.getSummary(9)).toBeNull();
+    expect(calls).toEqual([]);
+  });
+
+  it("旧正缓存行缺 large 时，getSummary 也回源一次并补齐封面", async () => {
+    const path = createTempDbPath();
+    const urls = coverUrls(61);
+    seedV4Cache(path, [
+      {
+        id: 61,
+        grid: urls.grid,
+        small: urls.small,
+        common: urls.large,
+        summary: "旧简介 61",
+        summaryFetched: 1,
+      },
+    ]);
+
+    const { client, calls } = createFakeClient((id) => subjectFor(id));
+    const { service } = createTestService({ client, cachePath: path });
+
+    expect(await service.getSummary(61)).toBe("简介 61");
+    expect(calls).toEqual([61]);
+
+    expect(await service.getCovers([61])).toEqual({ "61": urls });
+    expect(calls).toEqual([61]);
   });
 });
 

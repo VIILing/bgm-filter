@@ -20,9 +20,12 @@ export const DEFAULT_COVER_CACHE_PATH = ".cache/covers.db";
  *   使配置 `BGM_API_TOKEN` 后旧的 404 负缓存不会继续挡住 NSFW 条目；
  * - v4：增加 `summary` / `summaryFetched` 列，与封面同源缓存简介；仅加列，
  *   **不清任何缓存**（v3 的有效正/负缓存全部保留，旧行 summaryFetched=0 表示
- *   简介未知，首次请求简介时按需回源）。
+ *   简介未知，首次请求简介时按需回源）；
+ * - v5：增加 `large`（原图 URL）列；仅加列，**不清任何缓存**。旧行 large 为空，
+ *   读取时从已缓存的 common/small/grid 安全推导（去掉 `/r/<数字>/` 段），
+ *   推导失败保持 null；该行下次正常回源时写入真实 large。
  */
-export const COVER_CACHE_VERSION = 4;
+export const COVER_CACHE_VERSION = 5;
 
 /** 负缓存原因；`ok` 仅用于正缓存。 */
 export type CoverCacheReason =
@@ -36,6 +39,11 @@ export interface CoverCacheEntry {
   grid: string | null;
   small: string | null;
   common: string | null;
+  /**
+   * 原图 URL（无 `/r/` 前缀）。v4 旧行在读取时由 common/small/grid 推导；
+   * 推导失败为 null（正缓存行会在下一次 getCovers 时正常回源补齐）。
+   */
+  large: string | null;
   /** 缓存的简介；`summaryFetched=false` 时无意义（尚未取到）。 */
   summary: string | null;
   /** true=简介已有定论（有值或确定为空/404）。 */
@@ -61,6 +69,7 @@ interface CoverCacheRow {
   grid: string | null;
   small: string | null;
   common: string | null;
+  large: string | null;
   summary: string | null;
   summaryFetched: number | bigint;
   fetchedAt: number | bigint;
@@ -74,6 +83,7 @@ const CREATE_TABLE_SQL = `
     grid      TEXT,
     small     TEXT,
     common    TEXT,
+    large     TEXT,
     summary   TEXT,
     summaryFetched INTEGER NOT NULL DEFAULT 0,
     "fetchedAt" INTEGER NOT NULL,
@@ -83,12 +93,13 @@ const CREATE_TABLE_SQL = `
 `;
 
 const UPSERT_SQL = `
-  INSERT INTO cover_cache (id, grid, small, common, summary, summaryFetched, "fetchedAt", missing, reason)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO cover_cache (id, grid, small, common, large, summary, summaryFetched, "fetchedAt", missing, reason)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   ON CONFLICT(id) DO UPDATE SET
     grid = excluded.grid,
     small = excluded.small,
     common = excluded.common,
+    large = excluded.large,
     summary = excluded.summary,
     summaryFetched = excluded.summaryFetched,
     "fetchedAt" = excluded."fetchedAt",
@@ -123,6 +134,7 @@ export class CoverCache {
     this.db.exec(CREATE_TABLE_SQL);
     this.ensureReasonColumn();
     this.ensureSummaryColumns();
+    this.ensureLargeColumn();
     this.migrate();
   }
 
@@ -152,12 +164,22 @@ export class CoverCache {
     }
   }
 
+  /** v5：补 `large`（原图 URL）列；旧行为 NULL，由读取层按需推导。 */
+  private ensureLargeColumn(): void {
+    const columns = this.db
+      .prepare("PRAGMA table_info(cover_cache)")
+      .all() as unknown as Array<{ name?: string }>;
+    if (columns.some((column) => column.name === "large")) return;
+    this.db.exec("ALTER TABLE cover_cache ADD COLUMN large TEXT");
+  }
+
   /**
    * 幂等、分版本迁移：
    * - v0/v1/v2 → v3：清空全部 `missing=1` 负缓存（NSFW 门禁取消 / 引入 reason），
    *   并把旧正缓存的 reason 补成 `ok`；
    * - v3 → v4：仅加 `summary` / `summaryFetched` 列（由 ensureSummaryColumns 完成），
-   *   **不清任何缓存**（v3 的有效正/负缓存全部保留）。
+   *   **不清任何缓存**（v3 的有效正/负缓存全部保留）；
+   * - v4 → v5：仅加 `large` 列（由 ensureLargeColumn 完成），**不清任何缓存**。
    *
    * 迁移失败不影响服务：保留原库继续用，下次打开会重试，绝不让 covers 接口因
    * 缓存迁移报错。
@@ -179,7 +201,7 @@ export class CoverCache {
               "UPDATE cover_cache SET reason = 'ok' WHERE missing = 0 AND reason = 'unknown'",
             );
           }
-          // v3 → v4 只有加列（已由 ensureSummaryColumns 在事务外完成），不删任何行。
+          // v3 → v4 / v4 → v5 只有加列（已由 ensure*Column 在事务外完成），不删任何行。
           this.db.exec(`PRAGMA user_version = ${COVER_CACHE_VERSION}`);
         }
         this.db.exec("COMMIT");
@@ -220,7 +242,7 @@ export class CoverCache {
     const placeholders = ids.map(() => "?").join(", ");
     const rows = this.db
       .prepare(
-        `SELECT id, grid, small, common, summary, summaryFetched, "fetchedAt", missing, reason
+        `SELECT id, grid, small, common, large, summary, summaryFetched, "fetchedAt", missing, reason
            FROM cover_cache
           WHERE id IN (${placeholders})`,
       )
@@ -238,6 +260,10 @@ export class CoverCache {
         grid: normalizeText(row.grid),
         small: normalizeText(row.small),
         common: normalizeText(row.common),
+        // v4 旧行没有 large：从 common（其次 small/grid）安全推导，推导失败保持 null。
+        large:
+          normalizeText(row.large) ??
+          deriveLargeUrl(row.common ?? row.small ?? row.grid),
         summary: normalizeText(row.summary),
         summaryFetched: Number(row.summaryFetched) !== 0,
         missing,
@@ -266,6 +292,7 @@ export class CoverCache {
           entry.urls?.grid ?? null,
           entry.urls?.small ?? null,
           entry.urls?.common ?? null,
+          entry.urls?.large ?? null,
           entry.summary ?? null,
           1, // summaryFetched：每次写入都来自一次已完成的回源，简介已有定论
           entry.fetchedAt,
@@ -289,6 +316,25 @@ export class CoverCache {
     this.closed = true;
     this.db.close();
   }
+}
+
+/**
+ * 从缩放封面 URL 安全推导原图 URL：只去掉紧跟在主机名后的 `/r/<数字>/` 段。
+ *
+ * 例：`https://lain.bgm.tv/r/400/pic/cover/l/c4/ca/1_d2tF2.jpg`
+ *   → `https://lain.bgm.tv/pic/cover/l/c4/ca/1_d2tF2.jpg`
+ *
+ * 只接受 http(s) + 数字宽度；无该段（可能已是原图或未知格式）或剩余路径为空
+ * 时返回 null，**不猜测**，交给调用方后续正常回源。该函数只做字符串处理，
+ * 绝不请求图片。
+ */
+export function deriveLargeUrl(url: string | null | undefined): string | null {
+  if (typeof url !== "string") return null;
+  const match = /^(https?:\/\/[^/]+)\/r\/\d+\/(.+)$/.exec(url.trim());
+  const origin = match?.[1];
+  const rest = match?.[2];
+  if (!origin || !rest) return null;
+  return `${origin}/${rest}`;
 }
 
 function normalizeReason(value: string | null): CoverCacheReason {

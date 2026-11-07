@@ -86,8 +86,9 @@ export const subjectRouter = createTRPCRouter({
 
   /**
    * 批量取封面 URL（最多 50 个 id，可重复/含非法值，服务端会清洗）。
-   * 只返回 URL，图片由浏览器直连 lain.bgm.tv；无封面/失败/NSFW 均为 null。
-   * 外部请求统一走 `bgmClient`，本路由不再需要 `ctx.db`。
+   * 每项为 `{grid, small, common, large}`：large 是原图（无 `/r/` 前缀），
+   * 旧缓存行可推导时同样返回，无法推导为 null；无封面/失败/NSFW 均为 null。
+   * 只返回 URL，图片由浏览器直连 lain.bgm.tv；外部请求统一走 `bgmClient`。
    */
   covers: publicProcedure
     .input(

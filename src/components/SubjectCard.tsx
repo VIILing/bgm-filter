@@ -1,11 +1,12 @@
 "use client";
 
-import { useState } from "react";
+import { useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent } from "react";
 
 import { formatCount, formatYear } from "~/lib/format";
 import { TYPE_LABEL, type CoverUrls, type SubjectCardDto } from "~/shared/subject-contract";
 
-const TYPE_BADGE: Record<number, string> = {
+/** 类型徽标配色（列表行与悬浮预览共用，保证两处颜色一致）。 */
+export const TYPE_BADGE: Record<number, string> = {
   1: "bg-emerald-100 text-emerald-800",
   2: "bg-sky-100 text-sky-800",
   3: "bg-violet-100 text-violet-800",
@@ -18,10 +19,10 @@ export interface SubjectCardProps {
   /** 封面 URL；`undefined` = 尚未加载，`null` = 无封面 / NSFW / 失败。 */
   cover?: CoverUrls | null;
   onTagClick: (tag: string) => void;
-  /** 鼠标进入本行：ResultList 据此延迟打开悬浮预览。 */
-  onHover?: () => void;
-  /** 鼠标离开本行：ResultList 据此延迟关闭预览。 */
-  onLeave?: () => void;
+  /** 是否启用点击弹窗（≥768 且鼠标设备）；禁用时行保留原始 target=_blank 跳转。 */
+  dialogEnabled?: boolean;
+  /** 普通左键 / Enter / Space：打开弹窗；参数是触发行链接，用于关闭后还原焦点。 */
+  onOpen?: (trigger: HTMLElement) => void;
 }
 
 /**
@@ -30,30 +31,52 @@ export interface SubjectCardProps {
  *
  * 封面只负责展示，不阻塞文字渲染：`cover` 未到达时先显示占位块，到达后替换。
  * 加载失败记录失败的 URL 并切回占位，同一 URL 不会反复重试。
+ * 悬浮只做行高亮（CSS），不触发任何预览请求；点击整卡由 ResultList 打开弹窗。
  */
-export function SubjectCard({ subject, cover, onTagClick, onHover, onLeave }: SubjectCardProps) {
+export function SubjectCard({ subject, cover, onTagClick, dialogEnabled, onOpen }: SubjectCardProps) {
   const [failedCoverUrl, setFailedCoverUrl] = useState<string | null>(null);
   const hasScore = subject.score > 0;
   const subtitle = subject.nameCn && subject.nameCn !== subject.name ? subject.nameCn : null;
   const dateText = formatYear(subject.year, subject.date);
   const tags = subject.tags.slice(0, 8);
   const fullTitle = subtitle ? `${subject.name} / ${subtitle}` : subject.name;
+  const canOpenDialog = Boolean(dialogEnabled && onOpen);
 
   const coverUrl = cover?.small && cover.small.length > 0 ? cover.small : null;
   const showCover = coverUrl !== null && coverUrl !== failedCoverUrl;
 
+  // 普通左键打开弹窗；Ctrl/Cmd/Shift/中键保留浏览器「新标签直跳」的默认行为。
+  const handleClick = (event: ReactMouseEvent<HTMLAnchorElement>) => {
+    if (!canOpenDialog || !onOpen) return;
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    if (event.button !== 0) return;
+    event.preventDefault();
+    onOpen(event.currentTarget);
+  };
+
+  // 行获得焦点时 Enter/Space 打开；带修饰键时保留浏览器默认（新窗口/标签）。
+  const handleKeyDown = (event: ReactKeyboardEvent<HTMLAnchorElement>) => {
+    if (!canOpenDialog || !onOpen) return;
+    if (event.key !== "Enter" && event.key !== " ") return;
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    onOpen(event.currentTarget);
+  };
+
   return (
-    <li
-      className="group relative transition-colors hover:bg-slate-50"
-      onMouseEnter={() => onHover?.()}
-      onMouseLeave={() => onLeave?.()}
-    >
+    <li className="group relative transition-colors hover:bg-slate-50">
       <a
         href={`https://bgm.tv/subject/${subject.id}`}
         target="_blank"
         rel="noreferrer"
-        title={fullTitle}
-        aria-label={`在 bgm.tv 打开 ${subject.name}`}
+        title={canOpenDialog ? `打开预览：${fullTitle}` : fullTitle}
+        aria-label={
+          canOpenDialog ? `打开 ${subject.name} 预览弹窗` : `在 bgm.tv 打开 ${subject.name}`
+        }
+        aria-haspopup={canOpenDialog ? "dialog" : undefined}
+        data-subject-trigger=""
+        onClick={handleClick}
+        onKeyDown={handleKeyDown}
         className="absolute inset-0 z-0 rounded-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-sky-500"
       />
 

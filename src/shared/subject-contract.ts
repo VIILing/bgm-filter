@@ -80,13 +80,22 @@ export interface SubjectSummaryDto {
 }
 
 /**
- * 卡片封面 URL。三个尺寸都由官方 API 的 `images` 原样取用：
- * grid = /r/100、small = /r/200、common = /r/400；浏览器直连 lain.bgm.tv。
+ * 卡片 / 预览封面 URL。全部由官方 API 的 `images` 取用：
+ * grid = /r/100、small = /r/200、common = /r/400、large = 原图（无 /r/ 前缀）；
+ * 浏览器直连 lain.bgm.tv，服务端只缓存 URL、不下载图片字节。
  */
 export interface CoverUrls {
   grid: string;
   small: string;
   common: string;
+  /**
+   * 原图（large）URL，不含 `/r/<数字>/` 缩放段，可直接用于 `<img>`（无 CORS）。
+   *
+   * v4 及更早的封面缓存没有该列；升级后服务端会从已缓存的 common（缺失时
+   * small/grid）安全推导。无法推导时保持 `null`，前端按
+   * `large → common → small → grid` 回退；该行下次正常回源时会写入真实 large。
+   */
+  large: string | null;
 }
 
 /** 单次 `subject.covers` 允许的最大 id 数（与搜索页每页条目数一致）。 */
